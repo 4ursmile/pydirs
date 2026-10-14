@@ -1,0 +1,157 @@
+name: Release
+
+# Only runs when a GitHub Release is published. Pushes, tags and manual
+# dispatch do NOT trigger this workflow.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  check-version:
+    name: Verify tag matches Cargo.toml version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare release tag with package version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          TAG_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')
+          echo "Release tag: ${TAG} (version ${TAG_VERSION})"
+          echo "Cargo.toml version: ${CARGO_VERSION}"
+          if [ "${TAG_VERSION}" != "${CARGO_VERSION}" ]; then
+            echo "::error::Release tag '${TAG}' does not match Cargo.toml version '${CARGO_VERSION}'. Bump Cargo.toml and re-release."
+            exit 1
+          fi
+
+  build-wheels:
+    name: Wheels ${{ matrix.name }}
+    needs: check-version
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runs-on: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+          - name: linux-aarch64
+            runs-on: ubuntu-latest
+            target: aarch64
+            manylinux: auto
+          - name: musllinux-x86_64
+            runs-on: ubuntu-latest
+            target: x86_64
+            manylinux: musllinux_1_2
+          - name: musllinux-aarch64
+            runs-on: ubuntu-latest
+            target: aarch64
+            manylinux: musllinux_1_2
+          - name: macos-x86_64
+            runs-on: macos-latest
+            target: x86_64
+            manylinux: ""
+          - name: macos-aarch64
+            runs-on: macos-latest
+            target: aarch64
+            manylinux: ""
+          - name: windows-x64
+            runs-on: windows-latest
+            target: x64
+            manylinux: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-wheels-${{ matrix.name }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  build-sdist:
+    name: Source distribution
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  smoke-test:
+    name: Smoke test on Python ${{ matrix.python }}
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python: ["3.9", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Install wheel from artifacts (no index)
+        run: |
+          pip install --no-index --find-links dist tinycache-rs
+          pip list | grep -i tinycache
+
+      - name: Import and round-trip a value
+        working-directory: /tmp
+        run: |
+          python -c "
+          import tinycache
+          from tinycache import Cache
+          print('tinycache', tinycache.__version__)
+          with Cache() as c:
+              assert c.set('smoke', 'ok') is True
+              assert c.get('smoke') == b'ok'
+          print('smoke test passed')
+          "
+
+  publish:
+    name: Publish to PyPI
+    needs: [check-version, build-wheels, build-sdist, smoke-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts to publish
+        run: ls -la dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true

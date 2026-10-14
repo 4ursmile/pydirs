@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint and Rust tests (no Python feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --no-default-features
+
+  test:
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build and test tools
+        run: pip install maturin "pytest>=7" pytest-asyncio
+
+      - name: Build and install extension (release)
+        run: maturin develop --release
+
+      # No version pin: pip resolves a pydantic release that supports each Python in the matrix.
+      - name: Install pydantic (optional extra, exercised by tests)
+        run: pip install pydantic
+
+      - name: Run Python tests
+        run: pytest

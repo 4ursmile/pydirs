@@ -1,0 +1,41 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tinycache-rs"
+dynamic = ["version"]
+description = "Lightweight, fast, Redis-like in-memory cache written in Rust"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["cache", "redis", "in-memory", "rust", "ttl", "lru"]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/4ursmile/tinycache"
+Repository = "https://github.com/4ursmile/tinycache"
+Changelog = "https://github.com/4ursmile/tinycache/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+pydantic = ["pydantic>=2.5"]
+test = ["pytest>=7", "pytest-asyncio>=0.23", "pydantic>=2.5"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "tinycache._tinycache"
+features = ["python"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
