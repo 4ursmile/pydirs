@@ -1,6 +1,6 @@
 """Lazy access to pydantic.
 
-Nothing in this module imports pydantic at import time, so ``import tinycache``
+Nothing in this module imports pydantic at import time, so ``import pydirs``
 works without pydantic installed. Pydantic is imported only when a pydantic
 feature is actually used.
 """
@@ -15,7 +15,7 @@ __all__ = ["INSTALL_HINT", "adapter", "available", "import_pydantic", "model_jso
 
 INSTALL_HINT = (
     "pydantic support requires pydantic; install it with: "
-    "pip install 'tinycache-rs[pydantic]'"
+    "pip install 'pydirs[pydantic]'"
 )
 
 

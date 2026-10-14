@@ -1,4 +1,4 @@
-"""Proves tinycache works without pydantic installed.
+"""Proves pydirs works without pydantic installed.
 
 pydantic is blocked in a child interpreter with a meta_path finder, so the
 import fails exactly as it would on a machine without it. The child process
@@ -26,8 +26,8 @@ _CHILD = textwrap.dedent(
         if mod == "pydantic" or mod.startswith("pydantic."):
             del sys.modules[mod]
 
-    import tinycache
-    from tinycache import Cache, Server
+    import pydirs
+    from pydirs import Cache, Server
 
     assert "pydantic" not in sys.modules
 
@@ -50,7 +50,7 @@ _CHILD = textwrap.dedent(
     try:
         cache.set_model("m", {"x": 1})
     except ImportError as exc:
-        assert "tinycache-rs[pydantic]" in str(exc), str(exc)
+        assert "pydirs[pydantic]" in str(exc), str(exc)
     else:
         raise AssertionError("set_model should need pydantic")
 

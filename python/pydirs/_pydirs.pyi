@@ -1,7 +1,7 @@
-"""Type stubs for the native ``tinycache._tinycache`` extension.
+"""Type stubs for the native ``pydirs._pydirs`` extension.
 
 These describe the bytes-level classes exposed by the Rust core. The public
-``tinycache.Cache`` subclass adds decoding, JSON and pydantic helpers.
+``pydirs.Cache`` subclass adds decoding, JSON and pydantic helpers.
 """
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Union

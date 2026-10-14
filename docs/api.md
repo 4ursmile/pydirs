@@ -1,8 +1,8 @@
 # Python API reference
 
 ```python
-from tinycache import Cache, Client, Server, Pipeline, ResponseError
-from tinycache import JsonSerializer, PydanticSerializer, Serializer
+from pydirs import Cache, Client, Server, Pipeline, ResponseError
+from pydirs import JsonSerializer, PydanticSerializer, Serializer
 ```
 
 `Cache` (in-process) and `Client` (talks to a running server) share one API.
@@ -115,7 +115,7 @@ with Cache(persist_dir="/tmp/tc-data") as c:
 - An object with `dumps(obj) -> bytes | str | int | float` and
   `loads(data) -> obj` methods. `dumps` produces a value the core accepts, and
   `loads` receives the bytes read back. The `Serializer` protocol in
-  `tinycache` describes this. `JsonSerializer` and `PydanticSerializer` are
+  `pydirs` describes this. `JsonSerializer` and `PydanticSerializer` are
   the built-in implementations. `PydanticSerializer(model=None)` needs pydantic.
 
 Any other `serializer` value raises `ValueError`.
@@ -342,11 +342,11 @@ c.mget_json(["a", "b", "nope"])   # [[1, 2], None, None]
 ### Pydantic methods
 
 Pydantic support is optional. Install it with
-`pip install "tinycache-rs[pydantic]"` (which requires `pydantic>=2.5`, v2 API
+`pip install "pydirs[pydantic]"` (which requires `pydantic>=2.5`, v2 API
 only). The package imports and works without pydantic. Pydantic is imported
 only when one of these methods, or a pydantic-typed `memoize`, is used.
 Without it they raise `ImportError` with the hint
-`pydantic support requires pydantic; install it with: pip install 'tinycache-rs[pydantic]'`.
+`pydantic support requires pydantic; install it with: pip install 'pydirs[pydantic]'`.
 
 Models are stored as the JSON from `TypeAdapter(type).dump_json`, and read back
 with `TypeAdapter(model).validate_json`. Any type pydantic can serialise works:
@@ -367,7 +367,7 @@ stored data does not match `model`. Corrupt bytes that are not JSON at all raise
 
 ```python
 from pydantic import BaseModel
-from tinycache import Cache
+from pydirs import Cache
 
 class User(BaseModel):
     id: int
@@ -629,8 +629,8 @@ Returns the server's statistics as text, in `key:value` lines under
 ## Command-line server
 
 ```bash
-tinycache-server [options]
-python -m tinycache [options]
+pydirs-server [options]
+python -m pydirs [options]
 ```
 
 Both run the same server. It prints a banner with the bound port and runs until
@@ -655,15 +655,15 @@ Exit codes:
 | `--dir PATH` | off | Persistence directory. Enables snapshots and the WAL. |
 | `--fsync POLICY` | `everysec` | `always`, `everysec` or `never`. Needs `--dir`. |
 | `--snapshot-interval SECONDS` | `300` | Seconds between background snapshots, only when there are unsaved writes. `0` disables the timer. Needs `--dir`. |
-| `--requirepass PASS` | none | Password clients must send with `AUTH`. Also read from `$TINYCACHE_PASSWORD`. A flag takes precedence over the variable. An empty password is refused. |
+| `--requirepass PASS` | none | Password clients must send with `AUTH`. Also read from `$PYDIRS_PASSWORD`. A flag takes precedence over the variable. An empty password is refused. |
 | `--allow-insecure` | off | Permit a non-loopback bind without a password. |
 | `--version` | | Print the version and exit. |
 
 The startup banner ends with the state of the options, for example
-`persist=/var/lib/tinycache auth=on` or `persist=off auth=off`.
+`persist=/var/lib/pydirs auth=on` or `persist=off auth=off`.
 
 Binding a non-loopback address (`0.0.0.0`, a LAN address) without a password is
 refused with exit code `2`, unless `--allow-insecure` is given. Set
-`--requirepass` or `TINYCACHE_PASSWORD` for a public bind.
+`--requirepass` or `PYDIRS_PASSWORD` for a public bind.
 
 For running it as a service, see [docs/persistence.md](persistence.md#running-as-a-service-untested-examples).

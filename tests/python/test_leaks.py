@@ -19,7 +19,7 @@ from typing import Optional
 
 import pytest
 
-from tinycache import Cache, Client, Server
+from pydirs import Cache, Client, Server
 
 pytestmark = pytest.mark.leak
 

@@ -8,7 +8,7 @@ from typing import Optional
 
 import pytest
 
-from tinycache import Cache
+from pydirs import Cache
 
 from helpers import SHORT_PX, wait_for_expiry
 
@@ -242,7 +242,7 @@ def test_memoize_ttl_expiry_recomputes(pc: Cache) -> None:
 
 
 def test_pydantic_serializer_round_trip(cache: Cache) -> None:
-    from tinycache import PydanticSerializer
+    from pydirs import PydanticSerializer
 
     ser = PydanticSerializer(User)
     data = ser.dumps(User(id=4, name="ser"))

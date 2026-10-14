@@ -19,7 +19,7 @@ from typing import Any, Callable, List, Optional
 
 import pytest
 
-from tinycache import Cache, CacheLockedError, CorruptDataError
+from pydirs import Cache, CacheLockedError, CorruptDataError
 
 SNAPSHOT = "snapshot.tcs"
 
@@ -405,7 +405,7 @@ def test_close_releases_the_lock_for_a_new_cache(tmp_path: pathlib.Path) -> None
 CRASH_WRITER = textwrap.dedent(
     """
     import sys, time
-    from tinycache import Cache
+    from pydirs import Cache
     c = Cache(persist_dir=sys.argv[1], fsync="always")
     for i in range(50):
         c.set(f"before{i}", f"v{i}")
@@ -466,7 +466,7 @@ def test_save_then_kill_keeps_the_saved_snapshot(tmp_path: pathlib.Path) -> None
     script = textwrap.dedent(
         """
         import sys, time
-        from tinycache import Cache
+        from pydirs import Cache
         c = Cache(persist_dir=sys.argv[1], fsync="always")
         c.set("durable", "yes")
         c.save()
@@ -511,7 +511,7 @@ def test_lock_held_by_live_subprocess_is_refused(tmp_path: pathlib.Path) -> None
     script = textwrap.dedent(
         """
         import sys, time
-        from tinycache import Cache
+        from pydirs import Cache
         c = Cache(persist_dir=sys.argv[1])
         print("locked", flush=True)
         time.sleep(60)
@@ -591,10 +591,10 @@ def test_bad_magic_is_corrupt(tmp_path: pathlib.Path) -> None:
 
 
 def test_exported_exceptions_are_the_native_classes() -> None:
-    import tinycache
+    import pydirs
 
-    assert issubclass(tinycache.CacheLockedError, OSError)
-    assert issubclass(tinycache.CorruptDataError, ValueError)
-    assert "CacheLockedError" in tinycache.__all__
-    assert "CorruptDataError" in tinycache.__all__
+    assert issubclass(pydirs.CacheLockedError, OSError)
+    assert issubclass(pydirs.CorruptDataError, ValueError)
+    assert "CacheLockedError" in pydirs.__all__
+    assert "CorruptDataError" in pydirs.__all__
 

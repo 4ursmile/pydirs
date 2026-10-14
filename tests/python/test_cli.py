@@ -1,4 +1,4 @@
-"""The ``tinycache-server`` / ``python -m tinycache`` command, run as a subprocess."""
+"""The ``pydirs-server`` / ``python -m pydirs`` command, run as a subprocess."""
 
 from __future__ import annotations
 
@@ -13,19 +13,19 @@ from typing import IO, Optional
 
 import pytest
 
-from tinycache import Client
-from tinycache._cli import build_parser, parse_size
+from pydirs import Client
+from pydirs._cli import build_parser, parse_size
 
 BANNER = re.compile(r"listening on (\S+):(\d+)")
 
 
 def _spawn(*args: str, env: Optional[dict] = None) -> subprocess.Popen:
     full_env = dict(os.environ)
-    full_env.pop("TINYCACHE_PASSWORD", None)
+    full_env.pop("PYDIRS_PASSWORD", None)
     if env:
         full_env.update(env)
     return subprocess.Popen(
-        [sys.executable, "-m", "tinycache", *args],
+        [sys.executable, "-m", "pydirs", *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -120,13 +120,13 @@ def test_bad_port_is_a_usage_error() -> None:
 
 def test_version_flag() -> None:
     proc = subprocess.run(
-        [sys.executable, "-m", "tinycache", "--version"],
+        [sys.executable, "-m", "pydirs", "--version"],
         capture_output=True,
         text=True,
         timeout=10,
     )
     assert proc.returncode == 0
-    assert "tinycache" in proc.stdout
+    assert "pydirs" in proc.stdout
 
 
 @pytest.mark.parametrize(

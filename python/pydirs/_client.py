@@ -1,7 +1,7 @@
-"""``Client``: a thread-safe, pure-Python client for the tinycache RESP2 server.
+"""``Client``: a thread-safe, pure-Python client for the pydirs RESP2 server.
 
 The wire protocol (RESP2) is encoded and decoded here by hand, so there is no
-dependency on redis-py. Every public method comes from ``TinyCacheAPI``; this
+dependency on redis-py. Every public method comes from ``PydirsAPI``; this
 module only implements the bytes-level backend on top of a small connection pool.
 
 Retry rule: a command is re-sent once on a fresh connection only when it is
@@ -21,7 +21,7 @@ import threading
 from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 
-from ._api import TinyCacheAPI, _check_set_args
+from ._api import PydirsAPI, _check_set_args
 from ._serializers import Serializer
 
 __all__ = ["AuthenticationError", "Client", "Pipeline", "ResponseError"]
@@ -218,8 +218,8 @@ class _Connection:
             pass
 
 
-class Client(TinyCacheAPI):
-    """Client for a running ``tinycache`` server (``python -m tinycache`` or ``tinycache.Server``).
+class Client(PydirsAPI):
+    """Client for a running ``pydirs`` server (``python -m pydirs`` or ``pydirs.Server``).
 
     It offers the same methods as ``Cache``. Every call borrows a pooled
     connection, so one ``Client`` can be shared by many threads; at most

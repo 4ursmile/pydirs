@@ -1,4 +1,4 @@
-"""``python -m tinycache`` with ``--dir``, ``--requirepass`` and the exit codes (PLAN 4e).
+"""``python -m pydirs`` with ``--dir``, ``--requirepass`` and the exit codes (PLAN 4e).
 
 Each test runs the real CLI as a subprocess, so signals, exit codes and the banner are
 the ones an operator sees.
@@ -18,14 +18,14 @@ from typing import List, Optional, Tuple
 
 import pytest
 
-from tinycache import AuthenticationError, Cache, Client
+from pydirs import AuthenticationError, Cache, Client
 
 BANNER = re.compile(r"listening on (\S+):(\d+) \((.*)\)")
 
 
 def _env(extra: Optional[dict] = None) -> dict:
     env = dict(os.environ)
-    env.pop("TINYCACHE_PASSWORD", None)
+    env.pop("PYDIRS_PASSWORD", None)
     if extra:
         env.update(extra)
     return env
@@ -33,7 +33,7 @@ def _env(extra: Optional[dict] = None) -> dict:
 
 def _spawn(*args: str, env: Optional[dict] = None) -> subprocess.Popen:
     return subprocess.Popen(
-        [sys.executable, "-m", "tinycache", *args],
+        [sys.executable, "-m", "pydirs", *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -198,7 +198,7 @@ def test_requirepass_flag_is_enforced(procs: List) -> None:
 
 
 def test_password_from_env_is_enforced(procs: List) -> None:
-    proc = _spawn("--port", "0", env={"TINYCACHE_PASSWORD": "envpw"})
+    proc = _spawn("--port", "0", env={"PYDIRS_PASSWORD": "envpw"})
     procs.append(proc)
     _, port, _ = _banner(proc)
     with Client(host="127.0.0.1", port=port, timeout=5) as anon:
@@ -210,7 +210,7 @@ def test_password_from_env_is_enforced(procs: List) -> None:
 
 
 def test_flag_password_wins_over_env(procs: List) -> None:
-    proc = _spawn("--port", "0", "--requirepass", "flagwins", env={"TINYCACHE_PASSWORD": "envloses"})
+    proc = _spawn("--port", "0", "--requirepass", "flagwins", env={"PYDIRS_PASSWORD": "envloses"})
     procs.append(proc)
     _, port, _ = _banner(proc)
     with Client(host="127.0.0.1", port=port, password="envloses", timeout=5) as c:
@@ -222,7 +222,7 @@ def test_flag_password_wins_over_env(procs: List) -> None:
 
 
 def test_empty_password_env_is_refused() -> None:
-    proc = _spawn("--port", "0", env={"TINYCACHE_PASSWORD": ""})
+    proc = _spawn("--port", "0", env={"PYDIRS_PASSWORD": ""})
     assert proc.wait(timeout=15) == 2
 
 

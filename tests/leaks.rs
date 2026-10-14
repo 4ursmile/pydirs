@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use _tinycache::core::{Config, Policy, Store};
+use _pydirs::core::{Config, Policy, Store};
 
 struct Counting;
 
@@ -262,7 +262,7 @@ fn server_start_stop_does_not_leak() {
     let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let cycle = |port: u16| {
         let store = quiet_store(0, Policy::NoEviction);
-        let handle = _tinycache::server::start(store, "127.0.0.1", port).expect("bind loopback");
+        let handle = _pydirs::server::start(store, "127.0.0.1", port).expect("bind loopback");
         handle.stop();
     };
     let port = free_port();
@@ -295,7 +295,7 @@ fn server_connect_disconnect_does_not_leak() {
     let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let store = quiet_store(0, Policy::NoEviction);
     let port = free_port();
-    let handle = _tinycache::server::start(store, "127.0.0.1", port).expect("bind loopback");
+    let handle = _pydirs::server::start(store, "127.0.0.1", port).expect("bind loopback");
     let connect_once = || {
         let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         use std::io::{Read, Write};
@@ -365,7 +365,7 @@ fn free_port() -> u16 {
 
 #[test]
 fn persistent_open_close_reopen_does_not_leak() {
-    use _tinycache::core::{FsyncPolicy, PersistConfig};
+    use _pydirs::core::{FsyncPolicy, PersistConfig};
 
     let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let dir = std::env::temp_dir().join(format!("tc-leak-persist-{}", std::process::id()));

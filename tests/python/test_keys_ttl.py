@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tinycache import Cache
+from pydirs import Cache
 
 from helpers import SHORT_PX, wait_for_expiry
 

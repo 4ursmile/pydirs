@@ -7,8 +7,8 @@ import time
 
 import pytest
 
-from tinycache import Cache
-from tinycache._tinycache import Cache as _NativeCache
+from pydirs import Cache
+from pydirs._pydirs import Cache as _NativeCache
 
 from helpers import SHORT_PX, wait_for_expiry
 

@@ -135,7 +135,7 @@ pub fn start_with_options(
         bgsave_running: Arc::new(AtomicBool::new(false)),
     });
     let handle = thread::Builder::new()
-        .name("tinycache-accept".into())
+        .name("pydirs-accept".into())
         .spawn(move || accept_loop(&listener, &ctx, &accept_shared))?;
     Ok(ServerHandle {
         port: local.port(),
@@ -172,7 +172,7 @@ fn accept_loop(listener: &TcpListener, ctx: &Arc<Ctx>, shared: &Shared) {
         };
         let ctx = Arc::clone(ctx);
         let spawned = thread::Builder::new()
-            .name("tinycache-conn".into())
+            .name("pydirs-conn".into())
             .spawn(move || serve(stream, &ctx));
         if let Ok(handle) = spawned {
             conns.push(Conn {

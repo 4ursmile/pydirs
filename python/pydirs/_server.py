@@ -5,7 +5,7 @@ from __future__ import annotations
 from types import TracebackType
 from typing import Optional, Type
 
-from ._tinycache import Server as _NativeServer
+from ._pydirs import Server as _NativeServer
 
 __all__ = ["Server"]
 

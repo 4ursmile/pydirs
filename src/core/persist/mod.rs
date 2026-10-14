@@ -284,7 +284,7 @@ impl Store {
         if pc.fsync == FsyncPolicy::EverySec {
             handles.push(spawn_ticker(
                 Arc::downgrade(&self.inner),
-                "tinycache-fsync",
+                "pydirs-fsync",
                 FSYNC_PERIOD,
                 |s| {
                     if let Some(p) = s.inner.durable.as_ref() {
@@ -298,7 +298,7 @@ impl Store {
         if pc.snapshot_interval_secs > 0 {
             handles.push(spawn_ticker(
                 Arc::downgrade(&self.inner),
-                "tinycache-snapshot",
+                "pydirs-snapshot",
                 Duration::from_secs(pc.snapshot_interval_secs),
                 |s| {
                     if s.inner.durable.as_ref().is_some_and(Persist::dirty) {

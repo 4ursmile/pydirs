@@ -1,7 +1,7 @@
-"""Command-line server: ``tinycache-server`` or ``python -m tinycache``.
+"""Command-line server: ``pydirs-server`` or ``python -m pydirs``.
 
 Starts one shared cache behind the RESP2 server so that many processes can use
-``tinycache.Client``. Prints a one-line banner with the bound port (use
+``pydirs.Client``. Prints a one-line banner with the bound port (use
 ``--port 0`` for a free port), runs until SIGINT or SIGTERM, then stops the server
 and closes the cache, which writes a final snapshot when ``--dir`` is set.
 
@@ -20,11 +20,11 @@ import threading
 from typing import Any, Callable, List, Optional, Sequence, TextIO
 
 from . import __version__
-from ._tinycache import CacheLockedError, CorruptDataError
+from ._pydirs import CacheLockedError, CorruptDataError
 
 __all__ = ["main"]
 
-PASSWORD_ENV = "TINYCACHE_PASSWORD"
+PASSWORD_ENV = "PYDIRS_PASSWORD"
 EXIT_RUNTIME = 1
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _SIZE_RE = re.compile(r"^\s*(\d+)\s*([kmgt]?)b?\s*$", re.IGNORECASE)
@@ -61,10 +61,10 @@ def _positive_port(text: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="tinycache-server",
-        description="Run a shared tinycache server (RESP2, Redis-compatible commands).",
+        prog="pydirs-server",
+        description="Run a shared pydirs server (RESP2, Redis-compatible commands).",
     )
-    parser.add_argument("--version", action="version", version=f"tinycache {__version__}")
+    parser.add_argument("--version", action="version", version=f"pydirs {__version__}")
     parser.add_argument("--host", default="127.0.0.1", help="address to bind (default: %(default)s)")
     parser.add_argument("--port", type=_positive_port, default=6380,
                         help="TCP port; 0 picks a free port (default: %(default)s)")
@@ -105,7 +105,7 @@ def check_bind_safety(host: str, password: Optional[str], allow_insecure: bool) 
     if password is None and not allow_insecure:
         raise UsageError(
             f"refusing to bind {host!r} without a password: set --requirepass "
-            "(or TINYCACHE_PASSWORD), or pass --allow-insecure to accept the risk"
+            "(or PYDIRS_PASSWORD), or pass --allow-insecure to accept the risk"
         )
 
 
@@ -165,7 +165,7 @@ def run(args: argparse.Namespace, out: TextIO = sys.stdout, stop: Optional[threa
         server.start()
         persistence = f"persist={persist_dir}" if persist_dir is not None else "persist=off"
         print(
-            f"tinycache {__version__} listening on {args.host}:{server.port} "
+            f"pydirs {__version__} listening on {args.host}:{server.port} "
             f"(max_memory={args.max_memory or 'unlimited'}, policy={args.policy}, "
             f"shards={args.shards}, {persistence}, auth={'on' if password else 'off'})",
             file=out,
@@ -178,24 +178,24 @@ def run(args: argparse.Namespace, out: TextIO = sys.stdout, stop: Optional[threa
         cache.close()
         if restore is not None:
             restore()
-    print("tinycache stopped", file=out, flush=True)
+    print("pydirs stopped", file=out, flush=True)
     return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Entry point for ``tinycache-server`` and ``python -m tinycache``. Returns the exit code."""
+    """Entry point for ``pydirs-server`` and ``python -m pydirs``. Returns the exit code."""
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
         return run(args)
     except UsageError as exc:
-        print(f"tinycache-server: error: {exc}", file=sys.stderr, flush=True)
+        print(f"pydirs-server: error: {exc}", file=sys.stderr, flush=True)
         return 2
     except DataError as exc:
-        print(f"tinycache-server: error: {exc}", file=sys.stderr, flush=True)
+        print(f"pydirs-server: error: {exc}", file=sys.stderr, flush=True)
         return EXIT_RUNTIME
     except OSError as exc:
-        print(f"tinycache-server: error: cannot listen on {args.host}:{args.port}: {exc}",
+        print(f"pydirs-server: error: cannot listen on {args.host}:{args.port}: {exc}",
               file=sys.stderr, flush=True)
         return 2
 

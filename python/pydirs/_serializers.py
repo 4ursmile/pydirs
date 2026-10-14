@@ -68,7 +68,7 @@ class PydanticSerializer:
 
     ``PydanticSerializer(model)`` validates against ``model`` on read.
     ``PydanticSerializer()`` serializes by the runtime type of each object and
-    reads back plain JSON. Requires pydantic (``pip install 'tinycache-rs[pydantic]'``).
+    reads back plain JSON. Requires pydantic (``pip install 'pydirs[pydantic]'``).
     """
 
     def __init__(self, model: Any = None) -> None:

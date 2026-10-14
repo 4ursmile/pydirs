@@ -1,4 +1,4 @@
-"""Shared fixtures for the tinycache Python test suite.
+"""Shared fixtures for the pydirs Python test suite.
 
 Tests use short TTLs (``px=50``) and 0.15 s sleeps so the whole suite stays fast.
 
@@ -14,7 +14,7 @@ from typing import Any, List
 
 import pytest
 
-from tinycache import Cache, Client, Server
+from pydirs import Cache, Client, Server
 
 _CACHE_KEYS = ("max_memory", "policy", "shards")
 

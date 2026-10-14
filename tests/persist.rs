@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use _tinycache::core::{Config, FsyncPolicy, PersistConfig, SaveStep, Store};
+use _pydirs::core::{Config, FsyncPolicy, PersistConfig, SaveStep, Store};
 
 // ---- helpers --------------------------------------------------------------
 

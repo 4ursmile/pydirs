@@ -62,7 +62,7 @@ jobs:
         run: maturin build --release --out dist
 
       - name: Install wheel
-        run: pip install --no-index --find-links dist tinycache-rs
+        run: pip install --no-index --find-links dist pydirs
 
       # No version pin: pip resolves a pydantic release that supports each Python in the matrix.
       - name: Install pydantic (optional extra, exercised by tests)
@@ -77,7 +77,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # Leak tests read this to scale iteration counts down under valgrind.
-      TINYCACHE_VALGRIND: "1"
+      PYDIRS_VALGRIND: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -94,7 +94,7 @@ jobs:
         run: |
           cargo test --no-default-features --no-run --message-format=json > cargo-test-build.json
           # Both the lib unit-test binary and the tests/leaks.rs binary must build.
-          TARGETS='["_tinycache", "leaks"]'
+          TARGETS='["_pydirs", "leaks"]'
           jq -r --argjson targets "$TARGETS" '
             select(.reason == "compiler-artifact" and .profile.test == true and .executable != null)
             | select(.target.name as $n | $targets | index($n))

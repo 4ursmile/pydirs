@@ -10,7 +10,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from tinycache import AuthenticationError, Cache, Client, ResponseError, Server
+from pydirs import AuthenticationError, Cache, Client, ResponseError, Server
 
 PASSWORD = "s3cret-pass"
 
@@ -161,7 +161,7 @@ def test_authentication_error_is_a_connection_error() -> None:
 
 
 def test_noauth_and_wrongpass_map_to_authentication_error() -> None:
-    from tinycache._client import _map_error
+    from pydirs._client import _map_error
 
     assert isinstance(_map_error("NOAUTH Authentication required."), AuthenticationError)
     assert isinstance(_map_error("WRONGPASS invalid password"), AuthenticationError)
@@ -169,7 +169,7 @@ def test_noauth_and_wrongpass_map_to_authentication_error() -> None:
 
 
 def test_unknown_errors_are_still_response_errors() -> None:
-    from tinycache._client import _map_error
+    from pydirs._client import _map_error
 
     assert isinstance(_map_error("ERR something odd"), ResponseError)
 
@@ -245,14 +245,14 @@ def test_info_reflects_keys_and_memory() -> None:
 
 
 def test_info_keeps_text_values_as_strings() -> None:
-    from tinycache._client import _parse_info
+    from pydirs._client import _parse_info
 
     parsed = _parse_info("# Persistence\r\npersistence_enabled:1\r\nlast_error:disk full: no space\r\n")
     assert parsed == {"persistence_enabled": 1, "last_error": "disk full: no space"}
 
 
 def test_info_converts_floats() -> None:
-    from tinycache._client import _parse_info
+    from pydirs._client import _parse_info
 
     assert _parse_info("ratio:0.5\r\nname:x")["ratio"] == 0.5
 

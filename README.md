@@ -1,12 +1,12 @@
-# tinycache
+# pydirs
 
-[![CI](https://github.com/4ursmile/tinycache/actions/workflows/ci.yml/badge.svg)](https://github.com/4ursmile/tinycache/actions/workflows/ci.yml)
-[![Release](https://github.com/4ursmile/tinycache/actions/workflows/release.yml/badge.svg)](https://github.com/4ursmile/tinycache/actions/workflows/release.yml)
-[![PyPI](https://img.shields.io/pypi/v/tinycache-rs.svg)](https://pypi.org/project/tinycache-rs/)
-[![Python](https://img.shields.io/pypi/pyversions/tinycache-rs.svg)](https://pypi.org/project/tinycache-rs/)
+[![CI](https://github.com/4ursmile/pydirs/actions/workflows/ci.yml/badge.svg)](https://github.com/4ursmile/pydirs/actions/workflows/ci.yml)
+[![Release](https://github.com/4ursmile/pydirs/actions/workflows/release.yml/badge.svg)](https://github.com/4ursmile/pydirs/actions/workflows/release.yml)
+[![PyPI](https://img.shields.io/pypi/v/pydirs.svg)](https://pypi.org/project/pydirs/)
+[![Python](https://img.shields.io/pypi/pyversions/pydirs.svg)](https://pypi.org/project/pydirs/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`tinycache` is a lightweight, in-process, Redis-like cache. The engine is written
+`pydirs` is a lightweight, in-process, Redis-like cache. The engine is written
 in Rust and exposed to Python through PyO3. It supports strings, hashes, lists and
 sets, key expiry, optional memory limits with LRU eviction, a `memoize` decorator,
 and an optional RESP2 server that `redis-py` clients can talk to.
@@ -15,15 +15,15 @@ and an optional RESP2 server that `redis-py` clients can talk to.
 ## Installation
 
 ```bash
-pip install tinycache-rs
+pip install pydirs
 ```
 
-The PyPI distribution is `tinycache-rs`; the import name is `tinycache`.
+The PyPI distribution is `pydirs`; the import name is `pydirs`.
 
 ## Quickstart
 
 ```python
-from tinycache import Cache
+from pydirs import Cache
 
 with Cache() as c:
     c.set("greeting", "hello", ex=60)   # expires in 60 seconds
@@ -57,7 +57,7 @@ Reads return `bytes` by default. Pass `Cache(decode=True)` to get `str` back.
 | Persistence | `Cache(persist_dir=..., fsync=..., snapshot_interval=...)`, `save()`, `persistent`, `persist_stats` |
 | Server | `Server(cache=c, host=..., port=..., password=...)`, `start()`, `stop()`, `port`, `running` |
 | Client | `Client(host, port, password, timeout, pool_size)`, same methods as `Cache`, `pipeline()`, `ping()`, `info()`, `save()`, `bgsave()`, `lastsave()` |
-| CLI | `tinycache-server` / `python -m tinycache` |
+| CLI | `pydirs-server` / `python -m pydirs` |
 
 Full signatures, return values and error behaviour are in
 [docs/api.md](docs/api.md).
@@ -68,7 +68,7 @@ Values can be stored as JSON using the standard library `json` module. No pickle
 is involved, so stored data is plain, portable JSON.
 
 ```python
-from tinycache import Cache
+from pydirs import Cache
 
 c = Cache()
 c.set_json("user:1", {"name": "Ada", "tags": ["math", "engines"]}, ex=300)
@@ -138,17 +138,17 @@ checked and the oldest one is evicted, repeating until usage is under the limit.
 Pydantic support is optional. Install it with the extra:
 
 ```bash
-pip install "tinycache-rs[pydantic]"
+pip install "pydirs[pydantic]"
 ```
 
-`tinycache` imports pydantic lazily. Without pydantic installed, everything else
+`pydirs` imports pydantic lazily. Without pydantic installed, everything else
 works unchanged, and calling a pydantic method raises `ImportError` with an
 install hint. The pydantic API used is v2 only (`TypeAdapter`), with
 `pydantic>=2.5`.
 
 ```python
 from pydantic import BaseModel
-from tinycache import Cache
+from pydirs import Cache
 
 class User(BaseModel):
     id: int
@@ -195,7 +195,7 @@ async def fetch_user(user_id: int) -> User:
 ## The `memoize` decorator
 
 ```python
-from tinycache import Cache
+from pydirs import Cache
 
 cache = Cache(serializer="json")
 
@@ -216,11 +216,11 @@ With the default `serializer="raw"`, the return value must be `bytes`, `str`,
 
 ## Server mode (RESP2)
 
-`tinycache` can also serve the cache over TCP using the Redis wire protocol,
+`pydirs` can also serve the cache over TCP using the Redis wire protocol,
 so existing Redis clients can connect to it.
 
 ```python
-from tinycache import Cache, Server
+from pydirs import Cache, Server
 
 cache = Cache()
 with Server(cache, host="127.0.0.1", port=6380) as srv:   # starts; stops on exit
@@ -260,7 +260,7 @@ By default a cache lives only in memory. Pass `persist_dir` to keep it on disk:
 the data is reloaded when the cache is opened again.
 
 ```python
-from tinycache import Cache
+from pydirs import Cache
 
 with Cache(persist_dir="/tmp/tc-demo", fsync="everysec") as c:
     c.set("greeting", "hello")
@@ -291,8 +291,8 @@ Read [docs/persistence.md](docs/persistence.md) before relying on it. In brief:
 Run the server with a data directory and a password, and let clients connect:
 
 ```bash
-export TINYCACHE_PASSWORD='choose-a-long-password'
-tinycache-server --host 0.0.0.0 --port 6380 --dir /var/lib/tinycache \
+export PYDIRS_PASSWORD='choose-a-long-password'
+pydirs-server --host 0.0.0.0 --port 6380 --dir /var/lib/pydirs \
     --fsync everysec --snapshot-interval 300
 ```
 
@@ -300,7 +300,7 @@ A public bind needs a password, and the server refuses to start without one.
 Clients then authenticate:
 
 ```python
-from tinycache import Client
+from pydirs import Client
 
 client = Client(host="10.0.0.5", port=6380, password="choose-a-long-password")
 client.set("answer", 42)
@@ -317,20 +317,20 @@ They are untested examples.
 
 A `Cache` lives inside one process, so workers in different processes do not
 see each other's data. To share it, run a server once and connect each worker
-with `tinycache.Client`, which has the same methods as `Cache`.
+with `pydirs.Client`, which has the same methods as `Cache`.
 
 ```bash
-tinycache-server --port 6380 --max-memory 256mb --policy allkeys-lru
-# or: python -m tinycache --port 6380
+pydirs-server --port 6380 --max-memory 256mb --policy allkeys-lru
+# or: python -m pydirs --port 6380
 ```
 
 The command prints a banner with the bound port and runs until Ctrl-C or
-SIGTERM. Run `tinycache-server --help` for all options. Binding a non-loopback
+SIGTERM. Run `pydirs-server --help` for all options. Binding a non-loopback
 address is refused unless you pass `--allow-insecure`, because password
 enforcement is not available in this release.
 
 ```python
-from tinycache import Client
+from pydirs import Client
 
 client = Client(host="127.0.0.1", port=6380, pool_size=8, timeout=5.0)
 client.set("answer", 42, ex=30)
@@ -355,7 +355,7 @@ client after the worker forks, so no socket is shared across processes.
 
 ```python
 # gunicorn.conf.py or app module
-from tinycache import Client
+from pydirs import Client
 
 _client = None
 
@@ -381,20 +381,20 @@ Measured with `benchmarks/compare.py` on one macOS machine (x86_64 build,
 CPython 3.13, Redis 8.6.1 on localhost, 64-byte values, 10k keys). Single run,
 not averaged, so treat it as indicative. Re-run it on your own hardware.
 
-**Python client (ops/s).** tinycache runs in-process, Redis over TCP, so this
+**Python client (ops/s).** pydirs runs in-process, Redis over TCP, so this
 shows the cost of the network hop, not a like-for-like engine comparison.
 
 | | SET | GET |
 |---|---:|---:|
 | Python `dict` | 3,410,059 | 5,008,027 |
-| `tinycache.Cache` (in-process) | 649,073 | 1,058,776 |
+| `pydirs.Cache` (in-process) | 649,073 | 1,058,776 |
 | redis-py to redis-server | 9,948 | 10,631 |
 
-**Wire protocol** (`tinycache.Server` vs `redis-server`, `redis-benchmark`, 50 clients, req/s).
+**Wire protocol** (`pydirs.Server` vs `redis-server`, `redis-benchmark`, 50 clients, req/s).
 
 | | pipeline 1 | | pipeline 16 | |
 |---|---:|---:|---:|---:|
-| | tinycache | redis | tinycache | redis |
+| | pydirs | redis | pydirs | redis |
 | SET | 69,348 | 72,411 | 163,265 | 560,224 |
 | GET | 67,069 | 70,822 | 862,069 | 719,424 |
 | INCR | 71,225 | 74,991 | 179,533 | 641,026 |
@@ -402,7 +402,7 @@ shows the cost of the network hop, not a like-for-like engine comparison.
 **Size.** Wheel 333 KB (extension module 646 KB, sdist 77 KB), against a 2.0 MB
 `redis-server` binary.
 
-**Memory, 1M keys x 64 B values.** Redis grew by 129 MB, tinycache by 187 MB
+**Memory, 1M keys x 64 B values.** Redis grew by 129 MB, pydirs by 187 MB
 (1.45x Redis; it was 501 MB before the memory rework). `used_memory` reports
 158 MB, within 20% of the real growth, so `max_memory` limits are now close to
 honest. On macOS freed memory is not always returned to the OS, so RSS after

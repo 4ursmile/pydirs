@@ -343,7 +343,7 @@ fn bgsave(ctx: &Ctx) -> Out {
     let store = ctx.store.clone();
     let running = Arc::clone(&ctx.bgsave_running);
     let spawned = thread::Builder::new()
-        .name("tinycache-bgsave".into())
+        .name("pydirs-bgsave".into())
         .spawn(move || {
             let _ = store.save();
             running.store(false, SeqCst);

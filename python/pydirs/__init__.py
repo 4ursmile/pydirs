@@ -1,10 +1,10 @@
-"""tinycache: a lightweight, Redis-like in-memory cache with a Rust core.
+"""pydirs: a lightweight, Redis-like in-memory cache with a Rust core.
 
 The pure-Python layer adds decoding, JSON and optional pydantic support on top
-of the native ``_tinycache`` extension. pydantic is never required.
+of the native ``_pydirs`` extension. pydantic is never required.
 
 ``Cache`` is the in-process cache. ``Client`` talks to a running server
-(``python -m tinycache``) over RESP2 and offers the same API.
+(``python -m pydirs``) over RESP2 and offers the same API.
 """
 
 from __future__ import annotations
@@ -13,12 +13,12 @@ from importlib import metadata as _metadata
 
 from ._cache import Cache
 from ._client import AuthenticationError, Client, ResponseError
-from ._tinycache import CacheLockedError, CorruptDataError
+from ._pydirs import CacheLockedError, CorruptDataError
 from ._serializers import JsonSerializer, PydanticSerializer, Serializer
 from ._server import Server
 
 try:
-    __version__: str = _metadata.version("tinycache-rs")
+    __version__: str = _metadata.version("pydirs")
 except _metadata.PackageNotFoundError:  # pragma: no cover - source checkout without install
     __version__ = "0.0.0+unknown"
 

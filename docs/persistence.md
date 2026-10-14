@@ -1,6 +1,6 @@
 # Persistence
 
-`tinycache` can keep its data on disk, so a cache survives a restart. Persistence
+`pydirs` can keep its data on disk, so a cache survives a restart. Persistence
 is opt-in: nothing is written unless you pass a `persist_dir`, or start the server
 with `--dir`.
 
@@ -10,7 +10,7 @@ Read the [limits](#what-is-guaranteed-and-what-is-not) section before relying on
 ## Enabling it
 
 ```python
-from tinycache import Cache
+from pydirs import Cache
 
 with Cache(persist_dir="/var/lib/myapp/cache", fsync="everysec") as c:
     c.set("user:1", "Ada")
@@ -18,7 +18,7 @@ with Cache(persist_dir="/var/lib/myapp/cache", fsync="everysec") as c:
 ```
 
 ```bash
-tinycache-server --dir /var/lib/tinycache --fsync everysec --snapshot-interval 300
+pydirs-server --dir /var/lib/pydirs --fsync everysec --snapshot-interval 300
 ```
 
 | Option | Default | Meaning |
@@ -114,7 +114,7 @@ that has been reused by an unrelated live process also blocks the open, and the
 operator has to remove `LOCK` by hand.
 
 Only one process may own a persist directory. Other processes should talk to
-the owner with `tinycache.Client`. See [README: Sharing a cache between processes](../README.md#sharing-a-cache-between-processes).
+the owner with `pydirs.Client`. See [README: Sharing a cache between processes](../README.md#sharing-a-cache-between-processes).
 
 ## Snapshots on demand
 
@@ -203,17 +203,17 @@ the paths, the user, and the password handling before using them.
 ### systemd
 
 ```ini
-# /etc/systemd/system/tinycache.service
+# /etc/systemd/system/pydirs.service
 [Unit]
-Description=tinycache server
+Description=pydirs server
 After=network.target
 
 [Service]
-User=tinycache
-Group=tinycache
-Environment=TINYCACHE_PASSWORD=change-me
-ExecStart=/usr/bin/env tinycache-server --host 127.0.0.1 --port 6380 \
-    --dir /var/lib/tinycache --fsync everysec --snapshot-interval 300 \
+User=pydirs
+Group=pydirs
+Environment=PYDIRS_PASSWORD=change-me
+ExecStart=/usr/bin/env pydirs-server --host 127.0.0.1 --port 6380 \
+    --dir /var/lib/pydirs --fsync everysec --snapshot-interval 300 \
     --max-memory 512mb --policy allkeys-lru
 # SIGTERM makes the server save a final snapshot before it exits.
 KillSignal=SIGTERM
@@ -232,15 +232,15 @@ Keep the password out of the unit file in production: put it in a root-readable
 ```dockerfile
 # Dockerfile (untested example)
 FROM python:3.12-slim
-RUN pip install --no-cache-dir tinycache-rs
-RUN useradd --system --home /data tinycache && mkdir -p /data && chown tinycache /data
-USER tinycache
+RUN pip install --no-cache-dir pydirs
+RUN useradd --system --home /data pydirs && mkdir -p /data && chown pydirs /data
+USER pydirs
 VOLUME ["/data"]
 EXPOSE 6380
 # Bind to all interfaces only with a password set, or the server refuses to start.
-ENV TINYCACHE_PASSWORD=change-me
-CMD ["tinycache-server", "--host", "0.0.0.0", "--port", "6380", "--dir", "/data"]
+ENV PYDIRS_PASSWORD=change-me
+CMD ["pydirs-server", "--host", "0.0.0.0", "--port", "6380", "--dir", "/data"]
 ```
 
-Do not ship `TINYCACHE_PASSWORD=change-me` as a real default. Pass the password
+Do not ship `PYDIRS_PASSWORD=change-me` as a real default. Pass the password
 at run time with `-e` or a secret.

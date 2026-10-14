@@ -121,16 +121,16 @@ jobs:
 
       - name: Install wheel from artifacts (no index)
         run: |
-          pip install --no-index --find-links dist tinycache-rs
-          pip list | grep -i tinycache
+          pip install --no-index --find-links dist pydirs
+          pip list | grep -i pydirs
 
       - name: Import and round-trip a value
         working-directory: /tmp
         run: |
           python -c "
-          import tinycache
-          from tinycache import Cache
-          print('tinycache', tinycache.__version__)
+          import pydirs
+          from pydirs import Cache
+          print('pydirs', pydirs.__version__)
           with Cache() as c:
               assert c.set('smoke', 'ok') is True
               assert c.get('smoke') == b'ok'

@@ -3,7 +3,7 @@ use std::thread;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 
-use _tinycache::core::{Config, Store};
+use _pydirs::core::{Config, Store};
 
 const KEYS: usize = 10_000;
 

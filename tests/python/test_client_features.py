@@ -9,7 +9,7 @@ from typing import Optional
 
 import pytest
 
-from tinycache import Cache, Client, Server
+from pydirs import Cache, Client, Server
 
 pydantic = pytest.importorskip("pydantic")
 BaseModel = pydantic.BaseModel
@@ -218,7 +218,7 @@ def test_len_and_flush_still_work_without_info(pc: Client) -> None:
 
 
 def test_pydantic_serializer_on_client(server: Server) -> None:
-    from tinycache import PydanticSerializer
+    from pydirs import PydanticSerializer
 
     with Client(host="127.0.0.1", port=server.port, serializer=PydanticSerializer(User)) as c:
         c.set("u", User(id=3, name="p"))

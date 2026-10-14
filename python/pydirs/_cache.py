@@ -1,7 +1,7 @@
 """The public ``Cache`` class: the native in-process backend plus the shared API.
 
 All user-facing behaviour (decoding, serializers, JSON, pydantic, dict sugar,
-memoize) lives in ``TinyCacheAPI`` (``_api.py``). This module only maps each
+memoize) lives in ``PydirsAPI`` (``_api.py``). This module only maps each
 bytes-level backend method onto the native Rust class.
 """
 
@@ -10,9 +10,9 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
-from ._api import TinyCacheAPI
+from ._api import PydirsAPI
 from ._serializers import Serializer
-from ._tinycache import Cache as _NativeCache
+from ._pydirs import Cache as _NativeCache
 
 __all__ = ["Cache"]
 
@@ -26,7 +26,7 @@ def _fspath(value: Any) -> Optional[str]:
     return os.fspath(value)
 
 
-class Cache(TinyCacheAPI, _NativeCache):
+class Cache(PydirsAPI, _NativeCache):
     """In-process, Redis-like cache.
 
     Reads return ``bytes``, or ``str`` when ``decode=True``. With

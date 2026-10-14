@@ -1,16 +1,16 @@
 # Architecture
 
-This document describes how `tinycache` is built and why. The public Python API
+This document describes how `pydirs` is built and why. The public Python API
 is in [api.md](api.md).
 
 ## Layers
 
 ```
-Python (tinycache package)          python/tinycache/
+Python (pydirs package)          python/pydirs/
   Cache, Client, Server, CLI          public API, decoding, serializers, pydantic, memoize
-        |  TinyCacheAPI mixin (_api.py) is shared by Cache and Client
+        |  PydirsAPI mixin (_api.py) is shared by Cache and Client
         |
-PyO3 binding (_tinycache)           src/lib.rs            (feature "python")
+PyO3 binding (_pydirs)           src/lib.rs            (feature "python")
         |
 Rust core (crate::core)             src/core/             (no Python dependency)
   Store -> shards -> hashbrown tables
@@ -24,18 +24,18 @@ on by default, gates PyO3. The core is tested with
 `cargo test --no-default-features`, which is what CI's lint job runs.
 
 Two Python classes serve the same API. `Cache` calls the native extension
-in-process. `Client` speaks RESP2 to a running `Server` (or `tinycache-server`)
+in-process. `Client` speaks RESP2 to a running `Server` (or `pydirs-server`)
 over a socket, with a small pure-Python RESP encoder and decoder. Both inherit
 decoding, serializers, JSON, pydantic, dict sugar and `memoize` from one mixin,
-`TinyCacheAPI`, which validates arguments and encodes values before calling a
+`PydirsAPI`, which validates arguments and encodes values before calling a
 small bytes-level backend. This keeps the two backends from drifting apart.
 
 ## Sharing across processes
 
 A `Cache` is private to its process. To share one cache between several
-processes, run the server (`tinycache-server` or `python -m tinycache`) once and
+processes, run the server (`pydirs-server` or `python -m pydirs`) once and
 have each process use a `Client`. The server is the same RESP2 server that
-`tinycache.Server` runs in-process, with a command-line front end.
+`pydirs.Server` runs in-process, with a command-line front end.
 
 ## Sharding
 
@@ -179,10 +179,10 @@ stable ABI for Python 3.9 and later.
 
 ## Build and packaging
 
-- `maturin` builds the extension and packages `python/` as the `tinycache`
-  package. The native module is `tinycache._tinycache`.
-- `tinycache-server` is a console script that points at `tinycache._cli:main`.
-  `python -m tinycache` runs the same command.
+- `maturin` builds the extension and packages `python/` as the `pydirs`
+  package. The native module is `pydirs._pydirs`.
+- `pydirs-server` is a console script that points at `pydirs._cli:main`.
+  `python -m pydirs` runs the same command.
 - The release profile uses fat LTO, `codegen-units = 1`, and `strip = true`.
   `panic` stays `unwind` because PyO3 requires it.
 
@@ -216,7 +216,7 @@ asserts on a single run.
   descriptors are compared by listing `/dev/fd`.
 - **CI** (`leaks` job, Linux only): the Rust test binaries run under
   `valgrind --leak-check=full --errors-for-leak-kinds=definite --error-exitcode=1`.
-  The binaries come from cargo's JSON build output. `TINYCACHE_VALGRIND=1` is set
+  The binaries come from cargo's JSON build output. `PYDIRS_VALGRIND=1` is set
   so the tests can lower their iteration counts. The Python `-m leak` tests run
   against a release build of the extension.
 

@@ -1,10 +1,10 @@
-"""Benchmark tinycache against Redis.
+"""Benchmark pydirs against Redis.
 
 Three comparisons, because "embedded vs network" is not apples to apples:
 
-1. Python embedded: tinycache.Cache (in-process) vs redis-py -> redis-server (TCP, localhost).
+1. Python embedded: pydirs.Cache (in-process) vs redis-py -> redis-server (TCP, localhost).
 2. Python dict baseline for reference.
-3. Wire protocol: redis-benchmark against tinycache.Server vs redis-server (same RESP clients).
+3. Wire protocol: redis-benchmark against pydirs.Server vs redis-server (same RESP clients).
 
 Usage: python benchmarks/compare.py [--n 200000] [--redis-port 6390] [--tc-port 6391]
 """
@@ -21,7 +21,7 @@ import threading
 import time
 from pathlib import Path
 
-import tinycache
+import pydirs
 
 
 def timeit(fn, n: int) -> float:
@@ -101,7 +101,7 @@ def main() -> None:
     rows: list[tuple[str, float, float, float]] = []
 
     # ---- 1. Python embedded ------------------------------------------------
-    c = tinycache.Cache()
+    c = pydirs.Cache()
     d: dict = {}
     tc_set, tc_get = run_ops(c.set, c.get)
     d_set, d_get = run_ops(d.__setitem__, d.get)
@@ -121,7 +121,7 @@ def main() -> None:
     print(f"{'':<34}{'SET':>12}{'GET':>12}")
     for name, s, g in (
         ("python dict", d_set, d_get),
-        ("tinycache.Cache (in-process)", tc_set, tc_get),
+        ("pydirs.Cache (in-process)", tc_set, tc_get),
         ("redis-py -> redis-server (TCP)", r_set, r_get),
     ):
         if s is None:
@@ -129,19 +129,19 @@ def main() -> None:
         nn = n if "redis-py" not in name else min(n, 50_000)
         print(f"{name:<34}{fmt(timeit(s, nn))}{fmt(timeit(g, nn))}")
 
-    print("\n== 8 Python threads, GET (ops/sec; GIL released in tinycache) ==")
-    print(f"{'tinycache.Cache':<34}{fmt(threaded(tc_get, n, 8))}")
+    print("\n== 8 Python threads, GET (ops/sec; GIL released in pydirs) ==")
+    print(f"{'pydirs.Cache':<34}{fmt(threaded(tc_get, n, 8))}")
 
     # ---- 2. Wire protocol (redis-benchmark) ---------------------------------
     if shutil.which("redis-benchmark") and redis_proc is not None:
-        srv = tinycache.Server(c, port=args.tc_port)
+        srv = pydirs.Server(c, port=args.tc_port)
         srv.start()
         try:
             for pipe in (1, 16):
                 tcb = redis_benchmark(args.tc_port, n, pipe)
                 rdb = redis_benchmark(args.redis_port, n, pipe)
                 print(f"\n== redis-benchmark, 50 clients, pipeline={pipe} (req/sec) ==")
-                print(f"{'':<14}{'tinycache':>14}{'redis':>14}")
+                print(f"{'':<14}{'pydirs':>14}{'redis':>14}")
                 for k in ("SET", "GET", "INCR"):
                     print(f"{k:<14}{fmt(tcb.get(k, 0)):>14}{fmt(rdb.get(k, 0)):>14}")
         finally:
@@ -158,14 +158,14 @@ def main() -> None:
                 pipe.execute()
         pipe.execute()
         redis_mb = (rss_kb(redis_proc.pid) - base) / 1024
-        c2 = tinycache.Cache()
+        c2 = pydirs.Cache()
         base_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         before = rss_kb(os.getpid())
         for i in range(1_000_000):
             c2.set(f"key:{i}", "x" * 64)
         tc_mb = (rss_kb(os.getpid()) - before) / 1024
         print(f"{'redis-server RSS growth':<34}{redis_mb:>10.1f} MB")
-        print(f"{'tinycache RSS growth':<34}{tc_mb:>10.1f} MB (core used_memory estimate: {c2.used_memory/1048576:.1f} MB)")
+        print(f"{'pydirs RSS growth':<34}{tc_mb:>10.1f} MB (core used_memory estimate: {c2.used_memory/1048576:.1f} MB)")
         _ = base_rss
 
     if redis_proc is not None:
@@ -173,7 +173,7 @@ def main() -> None:
 
     # ---- 4. Artifact size ----------------------------------------------------
     print("\n== Size ==")
-    so = list(Path(tinycache.__file__).parent.glob("_tinycache*"))
+    so = list(Path(pydirs.__file__).parent.glob("_pydirs*"))
     for f in so:
         print(f"{f.name:<34}{f.stat().st_size / 1024:>10.0f} KiB (extension module)")
     redis_bin = shutil.which("redis-server")

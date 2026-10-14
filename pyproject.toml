@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "tinycache-rs"
+name = "pydirs"
 dynamic = ["version"]
 description = "Lightweight, fast, Redis-like in-memory cache written in Rust"
 readme = "README.md"
@@ -24,12 +24,12 @@ classifiers = [
 ]
 
 [project.scripts]
-tinycache-server = "tinycache._cli:main"
+pydirs-server = "pydirs._cli:main"
 
 [project.urls]
-Homepage = "https://github.com/4ursmile/tinycache"
-Repository = "https://github.com/4ursmile/tinycache"
-Changelog = "https://github.com/4ursmile/tinycache/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/4ursmile/pydirs"
+Repository = "https://github.com/4ursmile/pydirs"
+Changelog = "https://github.com/4ursmile/pydirs/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 pydantic = ["pydantic>=2.5"]
@@ -37,7 +37,7 @@ test = ["pytest>=7", "pytest-asyncio>=0.23", "pydantic>=2.5"]
 
 [tool.maturin]
 python-source = "python"
-module-name = "tinycache._tinycache"
+module-name = "pydirs._pydirs"
 features = ["python"]
 
 [tool.pytest.ini_options]

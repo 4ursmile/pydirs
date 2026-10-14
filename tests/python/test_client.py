@@ -8,9 +8,9 @@ from collections.abc import Iterator
 
 import pytest
 
-import tinycache
-from tinycache import Cache, Client, ResponseError, Server
-from tinycache._client import _encode, _map_error, _read_reply
+import pydirs
+from pydirs import Cache, Client, ResponseError, Server
+from pydirs._client import _encode, _map_error, _read_reply
 
 from fake_resp import FakeServer, settle
 
@@ -80,7 +80,7 @@ def test_decode_binary_bulk_with_crlf_inside() -> None:
 
 @pytest.mark.parametrize("raw", [b"$5\r\nhi\r\n", b"?x\r\n", b":abc\r\n", b""])
 def test_decode_malformed_reply_is_broken(raw: bytes) -> None:
-    from tinycache._client import _Broken
+    from pydirs._client import _Broken
 
     with pytest.raises(_Broken):
         _decode(raw)
@@ -108,8 +108,8 @@ def test_error_message_maps_to_python_exception(message: str, exc_type: type) ->
 
 def test_response_error_is_exported_exception() -> None:
     assert issubclass(ResponseError, Exception)
-    assert "ResponseError" in tinycache.__all__
-    assert "Client" in tinycache.__all__
+    assert "ResponseError" in pydirs.__all__
+    assert "Client" in pydirs.__all__
 
 
 def test_server_errors_map_through_real_client(live) -> None:

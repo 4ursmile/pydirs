@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-15
+
+### Changed
+
+- Renamed the project to `pydirs` (PyPI distribution, import name, native module
+  `_pydirs`, `pydirs-server` command, `PYDIRS_PASSWORD`), because `tinycache-rs`
+  could not be published under the old name.
+
+### Fixed
+
+- Reopening a data directory right after dropping a store no longer fails with a
+  spurious "locked" error while the sweeper thread releases its last reference.
+- `Server.stop` keeps waking the accept thread until it exits, so shutdown cannot hang.
+- Release and CI workflows: `id-token: write` for PyPI publishing, wheel-based CI
+  install that works on Windows.
+
 ## [0.1.0] - 2026-10-14
 
 ### Added
@@ -17,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `pttl`. Lazy expiry on read plus a background sweeper thread.
 - Optional memory limit (`max_memory`) with `noeviction`, `allkeys-lru` and
   `volatile-lru` policies using sampled LRU.
-- Python package `tinycache` (distribution `tinycache-rs`) built with PyO3 and
+- Python package `pydirs` (distribution `pydirs`) built with PyO3 and
   maturin against the `abi3-py39` stable ABI, supporting Python 3.9 through 3.14.
 - `Cache` class with dict-style access, context-manager support and a `decode`
   option for `str` reads.
@@ -38,7 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closely. Constants are calibrated with `examples/mem_probe.rs`.
 - `Cache` and `Client` share one API mixin, so both support the same
   serializers, JSON, pydantic, decoding and `memoize`.
-- Optional pydantic support (`pip install "tinycache-rs[pydantic]"`, pydantic
+- Optional pydantic support (`pip install "pydirs[pydantic]"`, pydantic
   v2 only): `set_model`, `get_model`, `mget_model`, `hset_model` and
   `hget_model`. The package works without pydantic, which is imported lazily.
 - `memoize` returns real pydantic model instances when the return annotation
@@ -74,9 +90,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Serializer protocol: `Cache(serializer=...)` accepts `"raw"`, `"json"`, or any
   object with `dumps` and `loads` methods. `JsonSerializer` and
   `PydanticSerializer` are provided.
-- Command-line server: `tinycache-server` and `python -m tinycache`, with
+- Command-line server: `pydirs-server` and `python -m pydirs`, with
   `--host`, `--port`, `--max-memory`, `--policy`, `--shards`, `--dir`, `--fsync`,
-  `--snapshot-interval`, `--requirepass` (or `TINYCACHE_PASSWORD`),
+  `--snapshot-interval`, `--requirepass` (or `PYDIRS_PASSWORD`),
   `--allow-insecure` and `--version`. It refuses non-loopback binds without a
   password (exit code 2). A locked or corrupt data directory exits with code 1.
   On SIGINT or SIGTERM it stops and, with `--dir`, writes a final snapshot.
@@ -91,5 +107,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release workflow: publishes to PyPI when a GitHub Release is published, after
   verifying that the tag matches the `Cargo.toml` version.
 
-[Unreleased]: https://github.com/4ursmile/tinycache/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/4ursmile/tinycache/releases/tag/v0.1.0
+[Unreleased]: https://github.com/4ursmile/pydirs/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/4ursmile/pydirs/releases/tag/v0.1.1
+[0.1.0]: https://github.com/4ursmile/pydirs/releases/tag/v0.1.0

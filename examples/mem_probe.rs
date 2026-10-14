@@ -7,7 +7,7 @@
 
 use std::process::Command;
 
-use _tinycache::core::{Config, Store};
+use _pydirs::core::{Config, Store};
 
 const KEYS: usize = 1_000_000;
 const HASHES: usize = 100_000;

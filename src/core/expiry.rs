@@ -16,7 +16,7 @@ const MAX_ROUNDS: usize = 16;
 pub(crate) fn spawn(inner: Weak<Inner>, interval: Duration) {
     // If the OS refuses the thread, expired keys are still removed lazily on access.
     let _ = thread::Builder::new()
-        .name("tinycache-sweeper".into())
+        .name("pydirs-sweeper".into())
         .spawn(move || loop {
             thread::sleep(interval);
             let Some(inner) = inner.upgrade() else {

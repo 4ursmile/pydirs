@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tinycache import Cache
+from pydirs import Cache
 
 PAYLOAD = "x" * 400
 

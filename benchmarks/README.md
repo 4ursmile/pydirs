@@ -1,12 +1,12 @@
 # Benchmarks
 
-`compare.py` measures tinycache against a dict baseline and against Redis. It
+`compare.py` measures pydirs against a dict baseline and against Redis. It
 reports three things, because an in-process cache and a network server are not
 directly comparable.
 
-1. **Python embedded.** `tinycache.Cache` (in-process) against a plain `dict`,
+1. **Python embedded.** `pydirs.Cache` (in-process) against a plain `dict`,
    and against `redis-py` talking to `redis-server` over localhost TCP.
-2. **Wire protocol.** `redis-benchmark` against `tinycache.Server` and against
+2. **Wire protocol.** `redis-benchmark` against `pydirs.Server` and against
    `redis-server`, with the same RESP clients.
 3. **Size and memory.** Wheel and binary sizes, and RSS growth for 1M keys of
    64-byte values.

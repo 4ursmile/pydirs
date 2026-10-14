@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 
-from tinycache import Cache
+from pydirs import Cache
 
 
 def test_eight_threads_1000_incr_each_is_exact() -> None:

@@ -4,21 +4,21 @@ from __future__ import annotations
 
 import pytest
 
-from tinycache import Cache
+from pydirs import Cache
 
 
 def test_version_is_a_string() -> None:
-    import tinycache
+    import pydirs
 
-    assert isinstance(tinycache.__version__, str)
-    assert tinycache.__version__
+    assert isinstance(pydirs.__version__, str)
+    assert pydirs.__version__
 
 
 def test_all_exports_resolve() -> None:
-    import tinycache
+    import pydirs
 
-    for name in tinycache.__all__:
-        assert hasattr(tinycache, name), name
+    for name in pydirs.__all__:
+        assert hasattr(pydirs, name), name
 
 
 def test_default_get_returns_bytes(cache: Cache) -> None:

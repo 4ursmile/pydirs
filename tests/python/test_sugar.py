@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tinycache import Cache
+from pydirs import Cache
 
 
 def test_setitem_and_getitem(cache: Cache) -> None:

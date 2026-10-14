@@ -1,6 +1,6 @@
 """The public API shared by ``Cache`` (native backend) and ``Client`` (socket backend).
 
-``TinyCacheAPI`` holds every feature that does not depend on the transport:
+``PydirsAPI`` holds every feature that does not depend on the transport:
 serializers, ``decode=True``, JSON, pydantic helpers, dict-style sugar,
 ``memoize`` and the context manager. A subclass supplies a small bytes-level
 backend by implementing the ``_b_*`` methods below. The mixin validates
@@ -31,7 +31,7 @@ from . import _pydantic
 from ._memoize import make_decorator
 from ._serializers import Serializer, json_dumps, json_loads, resolve_serializer
 
-__all__ = ["TinyCacheAPI"]
+__all__ = ["PydirsAPI"]
 
 Key = Union[str, bytes, int, float]
 T = TypeVar("T")
@@ -67,7 +67,7 @@ def _check_set_args(ex: Any, px: Any, nx: bool, xx: bool) -> None:
         _positive_int(px, "px")
 
 
-class TinyCacheAPI:
+class PydirsAPI:
     """Mixin with the shared Cache/Client behaviour.
 
     Backend contract (bytes level). ``key``, ``field``, ``member`` and ``value``
@@ -478,7 +478,7 @@ class TinyCacheAPI:
         """Like ``lrange``, but decodes each element as JSON."""
         return [json_loads(raw) for raw in self._b_lrange(key, start, stop)]
 
-    # ---- pydantic (optional; pip install 'tinycache-rs[pydantic]') -------------------
+    # ---- pydantic (optional; pip install 'pydirs[pydantic]') -------------------
 
     def set_model(
         self,

@@ -1,8 +1,8 @@
-//! tinycache: a lightweight, Redis-like in-memory cache.
+//! pydirs: a lightweight, Redis-like in-memory cache.
 //!
 //! The Rust core lives in [`core`] and the RESP2 server in [`server`]. With the
 //! default `python` feature, this crate also builds the PyO3 extension module
-//! `_tinycache`, which the pure-Python `tinycache` package wraps.
+//! `_pydirs`, which the pure-Python `pydirs` package wraps.
 
 pub mod core;
 pub mod server;
@@ -27,13 +27,13 @@ mod bindings {
     use crate::server::{self, ServerHandle, ServerOptions};
 
     create_exception!(
-        _tinycache,
+        _pydirs,
         CacheLockedError,
         PyOSError,
         "The persistence directory is in use by another live process."
     );
     create_exception!(
-        _tinycache,
+        _pydirs,
         CorruptDataError,
         PyValueError,
         "The persisted snapshot failed its checksum or structure check."
@@ -175,9 +175,9 @@ mod bindings {
         }
     }
 
-    /// Bytes-level cache. The Python `tinycache.Cache` subclass adds decoding,
+    /// Bytes-level cache. The Python `pydirs.Cache` subclass adds decoding,
     /// JSON handling and dict-style sugar on top of this class.
-    #[pyclass(name = "Cache", module = "tinycache._tinycache", subclass)]
+    #[pyclass(name = "Cache", module = "pydirs._pydirs", subclass)]
     pub struct PyCache {
         store: Store,
         persist_dir: Option<PathBuf>,
@@ -679,7 +679,7 @@ mod bindings {
     }
 
     /// RESP2 server that serves a `Cache` over TCP.
-    #[pyclass(name = "Server", module = "tinycache._tinycache", subclass)]
+    #[pyclass(name = "Server", module = "pydirs._pydirs", subclass)]
     pub struct PyServer {
         store: Store,
         host: String,
@@ -790,7 +790,7 @@ mod bindings {
 
 #[cfg(feature = "python")]
 #[pymodule]
-fn _tinycache(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _pydirs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<bindings::PyCache>()?;
     m.add_class::<bindings::PyServer>()?;
     m.add(

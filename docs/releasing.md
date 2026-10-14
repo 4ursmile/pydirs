@@ -1,7 +1,7 @@
-# Releasing tinycache
+# Releasing pydirs
 
 Releases are published to PyPI automatically when a GitHub Release is
-published. The distribution name is `tinycache-rs`.
+published. The distribution name is `pydirs`.
 
 ## One-time setup
 
@@ -10,12 +10,12 @@ published. The distribution name is `tinycache-rs`.
 1. Sign in to <https://pypi.org>.
 2. Open **Account settings → API tokens** and choose **Add API token**.
 3. For the first upload of a new project, the token must be scoped to
-   **Entire account**. After `tinycache-rs` exists on PyPI, create a new token
+   **Entire account**. After `pydirs` exists on PyPI, create a new token
    scoped to that project only and use it instead.
 4. Copy the token. It starts with `pypi-` and is shown only once.
 
-Before the first release, check that the name `tinycache-rs` is still free on
-PyPI (<https://pypi.org/project/tinycache-rs/>).
+Before the first release, check that the name `pydirs` is still free on
+PyPI (<https://pypi.org/project/pydirs/>).
 
 ### 2. Add the repository secret
 
@@ -69,7 +69,7 @@ The workflow is `.github/workflows/release.yml`. It runs only on
 | `check-version` | Strips a leading `v` from the tag and compares it to `version` in `Cargo.toml`. Fails the run on mismatch. |
 | `build-wheels` | Builds wheels with `PyO3/maturin-action` for linux x86_64 and aarch64 (manylinux), linux x86_64 and aarch64 (musllinux), macOS x86_64 and arm64, and windows x64. One abi3 wheel per target covers Python 3.9 to 3.14. |
 | `build-sdist` | Builds the source distribution. |
-| `smoke-test` | Installs the built wheel on Python 3.9 and 3.14 (Ubuntu), imports `tinycache`, and runs a `set`/`get` round trip. |
+| `smoke-test` | Installs the built wheel on Python 3.9 and 3.14 (Ubuntu), imports `pydirs`, and runs a `set`/`get` round trip. |
 | `publish` | Runs after all jobs above succeed. Downloads every artifact into `dist/` and uploads it with `pypa/gh-action-pypi-publish`. |
 
 `skip-existing: true` is set, so re-running the workflow for a version already
@@ -104,7 +104,7 @@ jobs that already succeeded in the same run.
 **`smoke-test` fails on import.**
 The wheel built, but the native module does not load. Check the `Install wheel`
 step first, to confirm which wheel was picked up. Then check that the module
-name in `pyproject.toml` (`tinycache._tinycache`) matches what `src/lib.rs`
+name in `pyproject.toml` (`pydirs._pydirs`) matches what `src/lib.rs`
 exports.
 
 **Installing from PyPI fails on an uncommon platform.**

@@ -8,7 +8,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from tinycache import Cache, Server
+from pydirs import Cache, Server
 
 
 def _encode(*args: str) -> bytes:

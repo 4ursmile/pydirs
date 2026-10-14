@@ -1,4 +1,4 @@
-"""Constants and helpers shared by the tinycache test modules."""
+"""Constants and helpers shared by the pydirs test modules."""
 
 from __future__ import annotations
 
