@@ -24,13 +24,21 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, U
 from ._api import TinyCacheAPI, _check_set_args
 from ._serializers import Serializer
 
-__all__ = ["Client", "Pipeline", "ResponseError"]
+__all__ = ["AuthenticationError", "Client", "Pipeline", "ResponseError"]
 
 Key = Union[str, bytes, int, float]
 
 
 class ResponseError(Exception):
     """The server replied with an error that has no more specific Python exception."""
+
+
+class AuthenticationError(ConnectionError):
+    """The server requires a password that was not sent, or the one sent is wrong.
+
+    Subclasses ``ConnectionError``, so code that already handles connection failures
+    also catches it.
+    """
 
 
 class _ErrorReply:
@@ -131,9 +139,37 @@ def _map_error(message: str) -> Exception:
         return TypeError(message)
     if head == "OOM":
         return MemoryError(message)
+    if head in ("NOAUTH", "WRONGPASS") or message.startswith("ERR invalid password"):
+        return AuthenticationError(message)
     if message.startswith("ERR value is not an integer") or "would overflow" in message:
         return ValueError(message)
+    if message.startswith("ERR persistence is not enabled"):
+        return ValueError(message)
     return ResponseError(message)
+
+
+def _info_value(text: str) -> Any:
+    """Converts one INFO value: integers and floats become numbers, anything else stays text."""
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return text
+
+
+def _parse_info(text: str) -> Dict[str, Any]:
+    """Parses INFO text (``key:value`` lines, ``# Section`` headers ignored) into a dict."""
+    out: Dict[str, Any] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        out[key] = _info_value(value)
+    return out
 
 
 # ---- connections and pool ----------------------------------------------------
@@ -256,7 +292,7 @@ class Client(TinyCacheAPI):
             raise ConnectionError(f"AUTH failed: {exc}") from exc
         if isinstance(reply, _ErrorReply):
             conn.close()
-            raise ConnectionError(f"AUTH failed: {reply.message}")
+            raise AuthenticationError(f"AUTH failed: {reply.message}")
         return conn
 
     def _exchange(self, commands: List[bytes], retry: bool) -> List[Any]:
@@ -375,19 +411,33 @@ class Client(TinyCacheAPI):
         self._call("FLUSHALL")
 
     def _b_used_memory(self) -> int:
-        try:
-            info = self._call("INFO", "memory")
-        except ResponseError as exc:
-            if "unknown command" in str(exc):
-                raise NotImplementedError(
-                    "used_memory needs INFO, which this tinycache server does not implement"
-                ) from exc
-            raise
-        text = (info or b"").decode("utf-8", "replace")
-        for line in text.splitlines():
-            if line.startswith("used_memory:"):
-                return int(line.split(":", 1)[1])
-        raise NotImplementedError("the server's INFO reply has no used_memory field")
+        value = self.info().get("used_memory")
+        if not isinstance(value, int):
+            raise NotImplementedError("the server's INFO reply has no used_memory field")
+        return value
+
+    # ---- server admin and persistence ---------------------------------------------
+
+    def info(self, section: Optional[str] = None) -> Dict[str, Any]:
+        """Server statistics from ``INFO`` as a dict. Numeric values are converted to ``int``
+        or ``float``. Section headers are dropped, so keys are unique across sections."""
+        args: List[Any] = ["INFO"]
+        if section is not None:
+            args.append(section)
+        text = self._call(*args)
+        return _parse_info((text or b"").decode("utf-8", "replace"))
+
+    def save(self) -> None:
+        """Writes a snapshot now (``SAVE``). Raises ``ValueError`` if the server has no persistence."""
+        self._call("SAVE")
+
+    def bgsave(self) -> None:
+        """Starts a background snapshot (``BGSAVE``) and returns at once."""
+        self._call("BGSAVE")
+
+    def lastsave(self) -> int:
+        """Unix time, in whole seconds, of the last successful snapshot (0 if none)."""
+        return self._call("LASTSAVE")  # type: ignore[no-any-return]
 
     def _b_len(self) -> int:
         return self._call("DBSIZE")  # type: ignore[no-any-return]

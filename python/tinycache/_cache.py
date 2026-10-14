@@ -7,6 +7,7 @@ bytes-level backend method onto the native Rust class.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from ._api import TinyCacheAPI
@@ -16,6 +17,13 @@ from ._tinycache import Cache as _NativeCache
 __all__ = ["Cache"]
 
 Key = Union[str, bytes, int, float]
+
+
+def _fspath(value: Any) -> Optional[str]:
+    """Normalises ``persist_dir`` to a ``str`` path (or ``None``)."""
+    if value is None:
+        return None
+    return os.fspath(value)
 
 
 class Cache(TinyCacheAPI, _NativeCache):
@@ -35,8 +43,19 @@ class Cache(TinyCacheAPI, _NativeCache):
         shards: int = 64,
         decode: bool = False,
         serializer: Union[str, Serializer] = "raw",
+        persist_dir: Optional[Union[str, "os.PathLike[str]"]] = None,
+        fsync: str = "everysec",
+        snapshot_interval: int = 300,
     ) -> "Cache":
-        return super().__new__(cls, max_memory, policy, shards)  # type: ignore[no-any-return]
+        return super().__new__(  # type: ignore[no-any-return]
+            cls,
+            max_memory,
+            policy,
+            shards,
+            persist_dir=_fspath(persist_dir),
+            fsync=fsync,
+            snapshot_interval=snapshot_interval,
+        )
 
     def __init__(
         self,
@@ -45,8 +64,41 @@ class Cache(TinyCacheAPI, _NativeCache):
         shards: int = 64,
         decode: bool = False,
         serializer: Union[str, Serializer] = "raw",
+        persist_dir: Optional[Union[str, "os.PathLike[str]"]] = None,
+        fsync: str = "everysec",
+        snapshot_interval: int = 300,
     ) -> None:
+        """Creates a cache. With ``persist_dir`` the data is loaded from that directory and
+        written back there by ``save()``, by the background snapshotter and by ``close()``.
+
+        ``fsync`` is ``"always"``, ``"everysec"`` or ``"never"``. ``snapshot_interval`` is
+        seconds between background snapshots (0 disables them).
+
+        Raises ``CacheLockedError`` if another live process holds the directory, and
+        ``CorruptDataError`` if the snapshot in it is damaged.
+        """
         self._init_api(decode, serializer)
+
+    # ---- persistence ----------------------------------------------------------------
+
+    def save(self) -> None:
+        """Writes a snapshot to ``persist_dir`` now. Raises ``ValueError`` if persistence is off."""
+        _NativeCache.save(self)
+
+    @property
+    def persistent(self) -> bool:
+        """True when the cache was opened with ``persist_dir``."""
+        return _NativeCache.persistent.__get__(self, type(self))  # type: ignore[no-any-return]
+
+    @property
+    def persist_stats(self) -> Optional[Dict[str, Any]]:
+        """Persistence counters, or ``None`` when persistence is off."""
+        return _NativeCache.persist_stats.__get__(self, type(self))  # type: ignore[no-any-return]
+
+    def close(self) -> None:
+        """Stops background threads, writes a final snapshot (when persistent) and releases the
+        directory lock. Idempotent. The cache stays readable, but later writes are not logged."""
+        _NativeCache.close(self)
 
     # ---- bytes-level backend (native calls) ------------------------------------
 

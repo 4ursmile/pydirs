@@ -4,10 +4,16 @@ These describe the bytes-level classes exposed by the Rust core. The public
 ``tinycache.Cache`` subclass adds decoding, JSON and pydantic helpers.
 """
 
-from typing import Dict, Iterable, List, Mapping, Optional, Set, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Union
 
 Key = Union[str, bytes, int, float]
 Value = Union[str, bytes, int, float]
+
+class CacheLockedError(OSError):
+    """The persistence directory is in use by another live process."""
+
+class CorruptDataError(ValueError):
+    """The persisted snapshot failed its checksum or structure check."""
 
 class Cache:
     """Bytes-level cache backed by the Rust core. Subclassable."""
@@ -17,8 +23,18 @@ class Cache:
         max_memory: int = 0,
         policy: str = "noeviction",
         shards: int = 64,
+        persist_dir: Optional[str] = None,
+        fsync: str = "everysec",
+        snapshot_interval: int = 300,
     ) -> None: ...
     def close(self) -> None: ...
+
+    # persistence
+    def save(self) -> None: ...
+    @property
+    def persistent(self) -> bool: ...
+    @property
+    def persist_stats(self) -> Optional[Dict[str, Any]]: ...
 
     # strings
     def set(
@@ -81,6 +97,7 @@ class Server:
         cache: Cache,
         host: str = "127.0.0.1",
         port: int = 6380,
+        password: Optional[str] = None,
     ) -> None: ...
     def start(self) -> None: ...
     def stop(self) -> None: ...

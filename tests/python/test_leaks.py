@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import os
+import pathlib
 import subprocess
 import threading
 from collections.abc import Callable, Iterator
@@ -359,3 +360,37 @@ def test_async_memoize_loop_is_flat() -> None:
         _assert_flat(_measure_rss_growth(step, 1000))
     finally:
         cache.close()
+
+
+# ---- persistence (PLAN 4f, 4d) ----------------------------------------------------
+
+
+def test_persistent_cache_open_close_reopen_returns_fds_to_baseline(tmp_path: pathlib.Path) -> None:
+    """Open, write, close and reopen a persistent cache 50 times in one directory.
+
+    Each cycle opens the WAL, the LOCK file and the background threads. All of them must
+    be released on close, so the fd count goes back to the baseline and does not grow.
+    """
+    data = str(tmp_path / "leak")
+    # One warm-up cycle so lazily opened descriptors (imports, the first thread) are counted.
+    Cache(persist_dir=data).close()
+    gc.collect()
+    baseline = _fd_count()
+    for i in range(50):
+        c = Cache(persist_dir=data, fsync="always", snapshot_interval=1)
+        c.set(f"k{i}", "v" * 128)
+        c.close()
+    gc.collect()
+    assert _fd_count() <= baseline
+
+
+def test_persistent_cache_threads_do_not_accumulate(tmp_path: pathlib.Path) -> None:
+    data = str(tmp_path / "threads")
+    Cache(persist_dir=data, fsync="everysec", snapshot_interval=1).close()
+    gc.collect()
+    baseline = threading.active_count()
+    for _ in range(30):
+        c = Cache(persist_dir=data, fsync="everysec", snapshot_interval=1)
+        c.close()
+    gc.collect()
+    assert threading.active_count() <= baseline

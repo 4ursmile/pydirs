@@ -59,12 +59,13 @@ fn quiet_store(max_memory: usize, policy: Policy) -> Store {
         max_memory,
         policy,
         sweep_interval_ms: 0,
+        persist: None,
     })
 }
 
 #[test]
 fn set_delete_rounds_do_not_grow() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let s = quiet_store(0, Policy::NoEviction);
     let round = |s: &Store| {
         for i in 0..40_000 {
@@ -93,12 +94,13 @@ fn set_delete_rounds_do_not_grow() {
 
 #[test]
 fn ttl_keys_expire_through_sweeper_without_growth() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let s = Store::new(Config {
         shards: 16,
         max_memory: 0,
         policy: Policy::NoEviction,
         sweep_interval_ms: 1,
+        persist: None,
     });
     // Short real TTLs; the sweeper removes them with no reads to trigger lazy expiry.
     let round = |s: &Store| {
@@ -129,7 +131,7 @@ fn ttl_keys_expire_through_sweeper_without_growth() {
 
 #[test]
 fn flush_after_fill_releases_memory() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let s = quiet_store(0, Policy::NoEviction);
     let before = live();
     for round in 0..5 {
@@ -151,7 +153,7 @@ fn flush_after_fill_releases_memory() {
 
 #[test]
 fn collection_create_and_empty_auto_remove_does_not_grow() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let s = quiet_store(0, Policy::NoEviction);
     let round = |s: &Store| {
         for i in 0..20_000 {
@@ -183,7 +185,7 @@ fn collection_create_and_empty_auto_remove_does_not_grow() {
 
 #[test]
 fn eviction_churn_stays_under_budget_without_growth() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     // 256 KiB budget with 8k x 128 B inserts per round: every round forces heavy eviction.
     let max = 256 << 10;
     let s = quiet_store(max, Policy::AllKeysLru);
@@ -214,13 +216,14 @@ fn eviction_churn_stays_under_budget_without_growth() {
 
 #[test]
 fn store_create_close_drop_does_not_leak() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let cycle = || {
         let s = Store::new(Config {
             shards: 8,
             max_memory: 0,
             policy: Policy::NoEviction,
             sweep_interval_ms: 1,
+            persist: None,
         });
         s.set(b"k", vec![b'x'; 64], Some(1_000), false, false)
             .unwrap();
@@ -256,7 +259,7 @@ fn store_create_close_drop_does_not_leak() {
 
 #[test]
 fn server_start_stop_does_not_leak() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let cycle = |port: u16| {
         let store = quiet_store(0, Policy::NoEviction);
         let handle = _tinycache::server::start(store, "127.0.0.1", port).expect("bind loopback");
@@ -289,7 +292,7 @@ fn server_start_stop_does_not_leak() {
 
 #[test]
 fn server_connect_disconnect_does_not_leak() {
-    let _g = SERIAL.lock().unwrap();
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let store = quiet_store(0, Policy::NoEviction);
     let port = free_port();
     let handle = _tinycache::server::start(store, "127.0.0.1", port).expect("bind loopback");
@@ -358,4 +361,69 @@ fn free_port() -> u16 {
         .local_addr()
         .expect("local addr")
         .port()
+}
+
+#[test]
+fn persistent_open_close_reopen_does_not_leak() {
+    use _tinycache::core::{FsyncPolicy, PersistConfig};
+
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = std::env::temp_dir().join(format!("tc-leak-persist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = || Config {
+        shards: 16,
+        max_memory: 0,
+        policy: Policy::NoEviction,
+        sweep_interval_ms: 1,
+        persist: Some(PersistConfig {
+            dir: dir.clone(),
+            fsync: FsyncPolicy::Never,
+            snapshot_interval_secs: 0,
+        }),
+    };
+    // Alternate between close() (final snapshot, threads joined, lock released) and a plain
+    // drop. Every other cycle pays the snapshot's four fsyncs, which keeps the test under
+    // the leak suite's time budget while still exercising both teardown paths.
+    let cycle = |round: usize| {
+        let s = Store::open(cfg()).expect("open");
+        for i in 0..20 {
+            s.set(
+                format!("r{round}k{i}").as_bytes(),
+                vec![b'x'; 64],
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        }
+        if round.is_multiple_of(2) {
+            s.close();
+        }
+    };
+    // Warm up: the first cycles allocate the directory, buffers and thread stacks.
+    for round in 0..5 {
+        cycle(round);
+    }
+    let base = live();
+    let threads_base = thread_count();
+    let fds_base = fd_count();
+    for round in 5..55 {
+        cycle(round);
+    }
+    settle_threads(threads_base);
+    // Each cycle's dataset is dropped with its store, so live heap must stay flat. The
+    // directory itself grows by design; only memory, threads and fds are checked.
+    assert!(
+        live() <= base + TOLERANCE * 4,
+        "live bytes grew {base} -> {} over 50 persistent cycles",
+        live()
+    );
+    if let (Some(b), Some(a)) = (threads_base, thread_count()) {
+        assert!(a <= b, "persistence threads leaked: {b} -> {a}");
+    }
+    if let (Some(b), Some(a)) = (fds_base, fd_count()) {
+        assert!(a <= b, "persistence fds leaked: {b} -> {a}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

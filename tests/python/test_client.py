@@ -473,7 +473,12 @@ def test_pipeline_decode_option(live) -> None:
 # ---- ping and API parity -------------------------------------------------------------
 
 
+# Persistence belongs to the process that owns the data directory, so a remote Client
+# has no equivalent. Its server-side counterparts are SAVE, BGSAVE, LASTSAVE and INFO.
+CACHE_ONLY = {"persistent", "persist_stats"}
+
+
 def test_client_offers_every_public_cache_method() -> None:
     cache_api = {n for n in dir(Cache) if not n.startswith("_")}
     client_api = {n for n in dir(Client) if not n.startswith("_")}
-    assert cache_api - client_api == set()
+    assert cache_api - client_api == CACHE_ONLY

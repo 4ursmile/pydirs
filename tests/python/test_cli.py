@@ -113,31 +113,6 @@ def test_allow_insecure_permits_public_bind_for_the_process() -> None:
         assert proc.wait(timeout=10) == 0
 
 
-def test_requirepass_flag_is_not_supported_yet() -> None:
-    proc = _spawn("--port", "0", "--requirepass", "pw")
-    code = proc.wait(timeout=10)
-    err = proc.stderr.read() if proc.stderr else ""
-    assert code == 2
-    assert "not supported by this build yet" in err
-
-
-def test_password_env_is_not_supported_yet() -> None:
-    proc = _spawn("--port", "0", env={"TINYCACHE_PASSWORD": "pw"})
-    code = proc.wait(timeout=10)
-    err = proc.stderr.read() if proc.stderr else ""
-    assert code == 2
-    assert "not supported by this build yet" in err
-
-
-@pytest.mark.parametrize("flag", [["--dir", "/tmp/x"], ["--fsync", "always"], ["--snapshot-interval", "60"]])
-def test_persistence_flags_are_not_supported_yet(flag: list[str]) -> None:
-    proc = _spawn("--port", "0", *flag)
-    code = proc.wait(timeout=10)
-    err = proc.stderr.read() if proc.stderr else ""
-    assert code == 2
-    assert "not supported by this build yet" in err
-
-
 def test_bad_port_is_a_usage_error() -> None:
     proc = _spawn("--port", "70000")
     assert proc.wait(timeout=10) == 2

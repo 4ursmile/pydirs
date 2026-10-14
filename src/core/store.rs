@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use parking_lot::RwLock;
 
 use super::expiry;
+use super::persist::{codec, Persist, PersistConfig};
 use super::value::{
     alloc_size, coll_base, deadline, elem_size, pair_size, str_entry_size, table_bytes,
     table_growth, Coll, Collection, Entry, Map, Set, ShardMap,
@@ -24,7 +25,7 @@ pub enum Policy {
     VolatileLru,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub shards: usize,
     /// Approximate byte budget; 0 means unlimited.
@@ -32,6 +33,9 @@ pub struct Config {
     pub policy: Policy,
     /// Sweeper period in ms; 0 disables the background thread.
     pub sweep_interval_ms: u64,
+    /// Durability settings. `None` keeps the store purely in memory. Use [`Store::open`]
+    /// when this is set.
+    pub persist: Option<PersistConfig>,
 }
 
 impl Default for Config {
@@ -41,6 +45,7 @@ impl Default for Config {
             max_memory: 0,
             policy: Policy::NoEviction,
             sweep_interval_ms: 100,
+            persist: None,
         }
     }
 }
@@ -88,6 +93,8 @@ pub(crate) struct Inner {
     pub(crate) tick: AtomicU32,
     pub(crate) rng: AtomicU64,
     pub(crate) closed: AtomicBool,
+    /// Write-ahead log and lock. Attached only after recovery, so replay never logs.
+    pub(crate) durable: Option<Persist>,
 }
 
 /// Cheaply cloneable handle to a sharded store. The sweeper thread stops once
@@ -119,11 +126,27 @@ fn str_value(e: &Entry) -> Result<&[u8]> {
 }
 
 impl Store {
+    /// An in-memory store. Panics if `cfg.persist` is set: use [`Store::open`] for that.
     pub fn new(cfg: Config) -> Store {
         Self::with_clock(cfg, Arc::new(system_now_ms))
     }
 
     pub fn with_clock(cfg: Config, clock: Clock) -> Store {
+        assert!(
+            cfg.persist.is_none(),
+            "a persistent store must be opened with Store::open"
+        );
+        let sweep = cfg.sweep_interval_ms;
+        let store = Self::build(&cfg, clock);
+        if sweep > 0 {
+            expiry::spawn(Arc::downgrade(&store.inner), Duration::from_millis(sweep));
+        }
+        store
+    }
+
+    /// Builds the shared state without starting the sweeper or attaching persistence.
+    /// Persistence settings in `cfg` are ignored here; `open` attaches them.
+    pub(crate) fn build(cfg: &Config, clock: Clock) -> Store {
         let n = cfg.shards.max(1).next_power_of_two();
         let shards = (0..n)
             .map(|_| RwLock::new(ShardMap::default()))
@@ -150,19 +173,9 @@ impl Store {
             tick: AtomicU32::new(0),
             rng: AtomicU64::new(0x853c_49e6_748f_ea9b),
             closed: AtomicBool::new(false),
+            durable: None,
         });
-        if cfg.sweep_interval_ms > 0 {
-            expiry::spawn(
-                Arc::downgrade(&inner),
-                Duration::from_millis(cfg.sweep_interval_ms),
-            );
-        }
         Store { inner }
-    }
-
-    /// Stops the background sweeper. The store remains usable for reads and writes.
-    pub fn close(&self) {
-        self.inner.closed.store(true, Relaxed);
     }
 
     // ---- strings -------------------------------------------------------
@@ -196,6 +209,7 @@ impl Store {
         let expires_at = ttl_ms.map_or(0, |t| deadline(now, t));
         let entry = inner.new_entry(k, &v, expires_at);
         inner.put_locked(&mut shard, idx, h, k, entry);
+        inner.log(|b| codec::enc_set(b, k, expires_at, &v));
         Ok(true)
     }
 
@@ -232,8 +246,10 @@ impl Store {
             Some(e) => (parse_i64(str_value(e)?)?, e.expires_at),
         };
         let next = current.checked_add(delta).ok_or(StoreError::Overflow)?;
-        let entry = inner.new_entry(k, next.to_string().as_bytes(), expires_at);
+        let text = next.to_string();
+        let entry = inner.new_entry(k, text.as_bytes(), expires_at);
         inner.put_locked(&mut shard, idx, h, k, entry);
+        inner.log(|b| codec::enc_set(b, k, expires_at, text.as_bytes()));
         Ok(next)
     }
 
@@ -255,7 +271,9 @@ impl Store {
             inner.stamp(e);
             let old = e.heap_size();
             e.append_str(v);
-            let len = str_value(e)?.len();
+            let value = str_value(e)?;
+            let len = value.len();
+            inner.log(|b| codec::enc_set(b, k, e.expires_at, value));
             let new = e.heap_size();
             inner.resize(old, new);
             inner.settle(idx, &shard);
@@ -263,6 +281,7 @@ impl Store {
         } else {
             let entry = inner.new_entry(k, v, 0);
             inner.put_locked(&mut shard, idx, h, k, entry);
+            inner.log(|b| codec::enc_set(b, k, 0, v));
             Ok(v.len())
         }
     }
@@ -296,6 +315,8 @@ impl Store {
         match shard.find_mut(h, |e| e.key() == k) {
             Some(e) => {
                 e.expires_at = deadline(now, ttl_ms);
+                let at = e.expires_at;
+                self.inner.log(|b| codec::enc_expire(b, k, at));
                 true
             }
             None => false,
@@ -311,6 +332,7 @@ impl Store {
         match shard.find_mut(h, |e| e.key() == k) {
             Some(e) if e.expires_at != 0 => {
                 e.expires_at = 0;
+                self.inner.log(|b| codec::enc_expire(b, k, 0));
                 true
             }
             _ => false,
@@ -359,18 +381,20 @@ impl Store {
     /// Removes every key. Each shard's table is swapped for an empty one and the old
     /// table is freed outside the lock, so the memory goes back to the allocator.
     pub fn flush(&self) {
-        for (idx, lock) in self.inner.shards.iter().enumerate() {
-            let old = {
-                let mut shard = lock.write();
-                let heap: usize = shard.iter().map(Entry::heap_size).sum();
-                self.inner.refund(heap);
-                let old = std::mem::take(&mut *shard);
-                self.inner.settle(idx, &shard);
-                old
-            };
-            // Free the old bucket array and entries outside the lock.
-            drop(old);
+        let inner = &*self.inner;
+        // Every shard is locked at once so the FLUSH record is ordered against all writers.
+        let mut guards: Vec<_> = inner.shards.iter().map(|l| l.write()).collect();
+        inner.log(codec::enc_flush);
+        let mut old = Vec::with_capacity(guards.len());
+        for (idx, shard) in guards.iter_mut().enumerate() {
+            let heap: usize = shard.iter().map(Entry::heap_size).sum();
+            inner.refund(heap);
+            old.push(std::mem::take(&mut **shard));
+            inner.settle(idx, shard);
         }
+        drop(guards);
+        // Free the old bucket arrays and entries outside the locks.
+        drop(old);
     }
 
     pub fn used_memory(&self) -> usize {
@@ -397,6 +421,7 @@ impl Store {
         let Collection::Hash(map) = &mut coll.data else {
             return Err(StoreError::WrongType);
         };
+        inner.log(|b| codec::enc_hset(b, k, f, &v));
         let added = if let Some(old) = map.get_mut(f) {
             let (old_alloc, new_alloc) = (alloc_size(old.len()), alloc_size(v.len()));
             *old = v;
@@ -432,6 +457,7 @@ impl Store {
         let Collection::Hash(map) = &mut coll.data else {
             return Err(StoreError::WrongType);
         };
+        inner.log(|b| codec::enc_items(b, codec::OP_HDEL, k, fields));
         let mut removed = 0;
         for f in fields {
             if let Some((fk, v)) = map.remove_entry(*f) {
@@ -486,6 +512,12 @@ impl Store {
         let Collection::List(list) = &mut coll.data else {
             return Err(StoreError::WrongType);
         };
+        let op = if front {
+            codec::OP_LPUSH
+        } else {
+            codec::OP_RPUSH
+        };
+        inner.log(|b| codec::enc_items(b, op, k, vs.as_slice()));
         for v in vs {
             inner.coll_resize(&mut coll.bytes, 0, elem_size(v.len()));
             if front {
@@ -528,6 +560,12 @@ impl Store {
         };
         if let Some(v) = &popped {
             inner.coll_resize(&mut coll.bytes, elem_size(v.len()), 0);
+            let op = if front {
+                codec::OP_LPOP
+            } else {
+                codec::OP_RPOP
+            };
+            inner.log(|b| codec::enc_key(b, op, k));
         }
         inner.drop_if_empty(&mut shard, idx, h, k);
         Ok(popped)
@@ -573,6 +611,7 @@ impl Store {
         let Collection::Set(set) = &mut coll.data else {
             return Err(StoreError::WrongType);
         };
+        inner.log(|b| codec::enc_items(b, codec::OP_SADD, k, ms.as_slice()));
         let mut added = 0;
         for m in ms {
             let size = elem_size(m.len());
@@ -599,6 +638,7 @@ impl Store {
         let Collection::Set(set) = &mut coll.data else {
             return Err(StoreError::WrongType);
         };
+        inner.log(|b| codec::enc_items(b, codec::OP_SREM, k, ms));
         let mut removed = 0;
         for m in ms {
             if set.remove(*m) {
@@ -716,6 +756,7 @@ impl Inner {
             Ok(occupied) => {
                 let (e, _) = occupied.remove();
                 self.refund(e.heap_size());
+                self.log(|b| codec::enc_key(b, codec::OP_DEL, k));
                 true
             }
             Err(_) => false,
@@ -1725,6 +1766,7 @@ mod tests {
             max_memory: max,
             policy,
             sweep_interval_ms: 0,
+            persist: None,
         })
     }
 
@@ -1999,6 +2041,7 @@ mod tests {
             max_memory: 0,
             policy: Policy::NoEviction,
             sweep_interval_ms: 1,
+            persist: None,
         });
         thread::scope(|scope| {
             for t in 0..THREADS {
@@ -2041,6 +2084,7 @@ mod tests {
             max_memory: 50_000,
             policy: Policy::AllKeysLru,
             sweep_interval_ms: 0,
+            persist: None,
         });
         thread::scope(|scope| {
             for t in 0..8 {

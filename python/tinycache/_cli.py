@@ -3,12 +3,10 @@
 Starts one shared cache behind the RESP2 server so that many processes can use
 ``tinycache.Client``. Prints a one-line banner with the bound port (use
 ``--port 0`` for a free port), runs until SIGINT or SIGTERM, then stops the server
-and closes the cache. Exit codes: 0 for a clean stop, 2 for usage or
-configuration errors.
+and closes the cache, which writes a final snapshot when ``--dir`` is set.
 
-Persistence (``--dir``, ``--fsync``, ``--snapshot-interval``) and password
-enforcement (``--requirepass``) are parsed now but only work once the native module
-supports them. Until then, passing them exits with a clear message.
+Exit codes: 0 for a clean stop; 1 when the data directory is locked by another
+live process or its snapshot is corrupt; 2 for usage or configuration errors.
 """
 
 from __future__ import annotations
@@ -22,12 +20,12 @@ import threading
 from typing import Any, Callable, List, Optional, Sequence, TextIO
 
 from . import __version__
-from ._tinycache import Cache as _NativeCache
-from ._tinycache import Server as _NativeServer
+from ._tinycache import CacheLockedError, CorruptDataError
 
 __all__ = ["main"]
 
 PASSWORD_ENV = "TINYCACHE_PASSWORD"
+EXIT_RUNTIME = 1
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _SIZE_RE = re.compile(r"^\s*(\d+)\s*([kmgt]?)b?\s*$", re.IGNORECASE)
 _SIZE_FACTOR = {"": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30, "t": 1 << 40}
@@ -35,6 +33,10 @@ _SIZE_FACTOR = {"": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30, "t": 1 << 40}
 
 class UsageError(Exception):
     """A configuration problem that makes the server refuse to start (exit code 2)."""
+
+
+class DataError(Exception):
+    """The data directory cannot be used: locked by another process or corrupt (exit code 1)."""
 
 
 def parse_size(text: str) -> int:
@@ -78,68 +80,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-insecure", action="store_true",
                         help="allow binding a non-loopback host without a password")
     parser.add_argument("--dir", metavar="PATH", default=None,
-                        help="directory for snapshots and the append-only log (needs a newer build)")
-    parser.add_argument("--fsync", choices=["everysec", "always", "never"], default=None,
-                        help="when to fsync the log (needs a newer build)")
-    parser.add_argument("--snapshot-interval", type=int, default=None, metavar="SECONDS",
-                        help="seconds between background snapshots (needs a newer build)")
+                        help="directory for snapshots and the append-only log; omit to run in memory only")
+    parser.add_argument("--fsync", choices=["everysec", "always", "never"], default="everysec",
+                        help="when to fsync the log, with --dir (default: %(default)s)")
+    parser.add_argument("--snapshot-interval", type=_non_negative_int, default=300, metavar="SECONDS",
+                        help="seconds between background snapshots, 0 disables them (default: %(default)s)")
     return parser
 
 
-# ---- feature detection -------------------------------------------------------
-
-
-def supports_persistence() -> bool:
-    """True if the native Cache accepts the ``persist_dir`` keyword (a probe call)."""
+def _non_negative_int(text: str) -> int:
     try:
-        probe = _NativeCache(persist_dir=None)  # type: ignore[call-arg]
-    except TypeError:
-        return False
-    probe.close()
-    return True
-
-
-def supports_password() -> bool:
-    """True if the native Server accepts the ``password`` keyword (a probe call)."""
-    probe_cache = _NativeCache()
-    try:
-        _NativeServer(probe_cache, password=None)  # type: ignore[call-arg]
-    except TypeError:
-        return False
-    finally:
-        probe_cache.close()
-    return True
-
-
-def _check_feature_flags(args: argparse.Namespace, password: Optional[str]) -> None:
-    """Rejects persistence or password options the native module cannot honour."""
-    persist_flags = [
-        flag
-        for flag, value in (
-            ("--dir", args.dir),
-            ("--fsync", args.fsync),
-            ("--snapshot-interval", args.snapshot_interval),
-        )
-        if value is not None
-    ]
-    if persist_flags and not supports_persistence():
-        raise UsageError(
-            f"{', '.join(persist_flags)}: not supported by this build yet "
-            "(persistence arrives in a later release)"
-        )
-    if password is not None and not supports_password():
-        raise UsageError(
-            "--requirepass / TINYCACHE_PASSWORD: not supported by this build yet "
-            "(password enforcement arrives in a later release)"
-        )
+        value = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid integer {text!r}") from exc
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
 
 
 def check_bind_safety(host: str, password: Optional[str], allow_insecure: bool) -> None:
-    """Refuses a non-loopback bind without a password unless explicitly allowed.
-
-    Until the server enforces passwords, a password given here cannot be checked,
-    so ``--allow-insecure`` is the only way past this check on a public address.
-    """
+    """Refuses a non-loopback bind without a password unless explicitly allowed."""
     if host in LOOPBACK_HOSTS or host.startswith("127."):
         return
     if password is None and not allow_insecure:
@@ -170,23 +130,44 @@ def _install_signal_handlers(stop: threading.Event) -> Callable[[], None]:
 
 
 def run(args: argparse.Namespace, out: TextIO = sys.stdout, stop: Optional[threading.Event] = None) -> int:
-    """Starts the server with validated ``args``, waits for a stop signal, shuts down cleanly."""
+    """Starts the server with validated ``args``, waits for a stop signal, shuts down cleanly.
+
+    Raises ``UsageError`` for configuration problems and ``DataError`` for a locked or
+    corrupt data directory. Other ``OSError``s (such as a port in use) propagate.
+    """
     password = args.requirepass if args.requirepass is not None else os.environ.get(PASSWORD_ENV)
-    _check_feature_flags(args, password)
+    if password == "":
+        raise UsageError("the password must not be empty")
     check_bind_safety(args.host, password, args.allow_insecure)
 
     from ._cache import Cache
     from ._server import Server
 
+    persist_dir = args.dir
+    try:
+        cache = Cache(
+            max_memory=args.max_memory,
+            policy=args.policy,
+            shards=args.shards,
+            persist_dir=persist_dir,
+            fsync=args.fsync,
+            snapshot_interval=args.snapshot_interval,
+        )
+    except CacheLockedError as exc:
+        raise DataError(f"{exc}; stop the other server or choose another --dir") from exc
+    except CorruptDataError as exc:
+        raise DataError(f"{exc}; move the damaged files aside to start empty") from exc
+
     stop = stop or threading.Event()
     restore = _install_signal_handlers(stop) if threading.current_thread() is threading.main_thread() else None
-    cache = Cache(max_memory=args.max_memory, policy=args.policy, shards=args.shards)
-    server = Server(cache, host=args.host, port=args.port)
+    server = Server(cache, host=args.host, port=args.port, password=password)
     try:
         server.start()
+        persistence = f"persist={persist_dir}" if persist_dir is not None else "persist=off"
         print(
             f"tinycache {__version__} listening on {args.host}:{server.port} "
-            f"(max_memory={args.max_memory or 'unlimited'}, policy={args.policy}, shards={args.shards})",
+            f"(max_memory={args.max_memory or 'unlimited'}, policy={args.policy}, "
+            f"shards={args.shards}, {persistence}, auth={'on' if password else 'off'})",
             file=out,
             flush=True,
         )
@@ -210,6 +191,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except UsageError as exc:
         print(f"tinycache-server: error: {exc}", file=sys.stderr, flush=True)
         return 2
+    except DataError as exc:
+        print(f"tinycache-server: error: {exc}", file=sys.stderr, flush=True)
+        return EXIT_RUNTIME
     except OSError as exc:
         print(f"tinycache-server: error: cannot listen on {args.host}:{args.port}: {exc}",
               file=sys.stderr, flush=True)

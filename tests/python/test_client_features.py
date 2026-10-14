@@ -203,10 +203,11 @@ def test_memoize_ttl_expires_through_client(pc: Client) -> None:
     assert calls == [1, 1]
 
 
-def test_used_memory_raises_not_implemented_when_server_lacks_info(pc: Client) -> None:
-    # The server does not implement INFO yet, so used_memory degrades gracefully.
-    with pytest.raises(NotImplementedError, match="INFO"):
-        _ = pc.used_memory
+def test_used_memory_is_read_from_info(pc: Client) -> None:
+    before = pc.used_memory
+    pc.set("big", "x" * 4096)
+    assert pc.used_memory > before
+    assert pc.used_memory == pc.info()["used_memory"]
 
 
 def test_len_and_flush_still_work_without_info(pc: Client) -> None:

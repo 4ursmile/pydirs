@@ -12,16 +12,32 @@ use pyo3::prelude::*;
 
 #[cfg(feature = "python")]
 mod bindings {
+    use std::io;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
+    use pyo3::create_exception;
     use pyo3::exceptions::{PyMemoryError, PyOSError, PyTypeError, PyValueError};
     use pyo3::prelude::*;
     use pyo3::types::{
         PyBool, PyBytes, PyDict, PyFloat, PyInt, PySet, PyString, PyStringMethods, PyTuple,
     };
 
-    use crate::core::{Config, Policy, Store, StoreError};
-    use crate::server::{self, ServerHandle};
+    use crate::core::{Config, FsyncPolicy, PersistConfig, Policy, Store, StoreError};
+    use crate::server::{self, ServerHandle, ServerOptions};
+
+    create_exception!(
+        _tinycache,
+        CacheLockedError,
+        PyOSError,
+        "The persistence directory is in use by another live process."
+    );
+    create_exception!(
+        _tinycache,
+        CorruptDataError,
+        PyValueError,
+        "The persisted snapshot failed its checksum or structure check."
+    );
 
     /// Maps a core error onto the Python exception documented in docs/api.md.
     fn to_py_err(e: StoreError) -> PyErr {
@@ -30,6 +46,36 @@ mod bindings {
             StoreError::WrongType => PyTypeError::new_err(msg),
             StoreError::Oom => PyMemoryError::new_err(msg),
             StoreError::NotInteger | StoreError::Overflow => PyValueError::new_err(msg),
+        }
+    }
+
+    /// Maps an error from opening a persistence directory. `WouldBlock` means the lock is
+    /// held, `InvalidData` means the snapshot is corrupt, anything else is a plain OSError.
+    fn open_err(dir: &Path, e: io::Error) -> PyErr {
+        match e.kind() {
+            io::ErrorKind::WouldBlock => CacheLockedError::new_err(format!(
+                "data directory {} is in use by another live process",
+                dir.display()
+            )),
+            io::ErrorKind::InvalidData => {
+                CorruptDataError::new_err(format!("cannot load data from {}: {e}", dir.display()))
+            }
+            _ => PyOSError::new_err(format!("cannot open data directory {}: {e}", dir.display())),
+        }
+    }
+
+    fn save_err(e: io::Error) -> PyErr {
+        PyOSError::new_err(format!("save failed: {e}"))
+    }
+
+    fn parse_fsync(name: &str) -> PyResult<FsyncPolicy> {
+        match name {
+            "always" => Ok(FsyncPolicy::Always),
+            "everysec" => Ok(FsyncPolicy::EverySec),
+            "never" => Ok(FsyncPolicy::Never),
+            other => Err(PyValueError::new_err(format!(
+                "unknown fsync {other:?}; expected 'always', 'everysec' or 'never'"
+            ))),
         }
     }
 
@@ -134,32 +180,89 @@ mod bindings {
     #[pyclass(name = "Cache", module = "tinycache._tinycache", subclass)]
     pub struct PyCache {
         store: Store,
+        persist_dir: Option<PathBuf>,
     }
 
     #[pymethods]
     impl PyCache {
         #[new]
-        #[pyo3(signature = (max_memory=0, policy="noeviction", shards=64))]
-        fn new(max_memory: usize, policy: &str, shards: usize) -> PyResult<Self> {
+        #[pyo3(signature = (max_memory=0, policy="noeviction", shards=64, persist_dir=None,
+                            fsync="everysec", snapshot_interval=300))]
+        #[allow(clippy::too_many_arguments)]
+        fn new(
+            py: Python<'_>,
+            max_memory: usize,
+            policy: &str,
+            shards: usize,
+            persist_dir: Option<PathBuf>,
+            fsync: &str,
+            snapshot_interval: i64,
+        ) -> PyResult<Self> {
             if shards == 0 || !shards.is_power_of_two() || shards > 65_536 {
                 return Err(PyValueError::new_err(
                     "shards must be a power of two between 1 and 65536",
                 ));
             }
+            let policy = parse_policy(policy)?;
+            let fsync = parse_fsync(fsync)?;
+            let snapshot_interval_secs = u64::try_from(snapshot_interval)
+                .map_err(|_| PyValueError::new_err("snapshot_interval must be >= 0"))?;
+            let persist = persist_dir.clone().map(|dir| PersistConfig {
+                dir,
+                fsync,
+                snapshot_interval_secs,
+            });
             let cfg = Config {
                 shards,
                 max_memory,
-                policy: parse_policy(policy)?,
+                policy,
+                persist,
                 ..Config::default()
             };
-            Ok(Self {
-                store: Store::new(cfg),
-            })
+            let store = match persist_dir.as_deref() {
+                Some(dir) => {
+                    let dir = dir.to_path_buf();
+                    py.allow_threads(move || Store::open(cfg))
+                        .map_err(|e| open_err(&dir, e))?
+                }
+                None => Store::new(cfg),
+            };
+            Ok(Self { store, persist_dir })
         }
 
         fn close(&self, py: Python<'_>) {
             let store = &self.store;
             py.allow_threads(move || store.close());
+        }
+
+        /// Writes a snapshot now. Raises OSError on I/O failure, ValueError if persistence is off.
+        fn save(&self, py: Python<'_>) -> PyResult<()> {
+            if self.persist_dir.is_none() {
+                return Err(PyValueError::new_err("persistence is not enabled"));
+            }
+            let store = &self.store;
+            py.allow_threads(move || store.save()).map_err(save_err)
+        }
+
+        /// True when this cache was opened with a `persist_dir`.
+        #[getter]
+        fn persistent(&self) -> bool {
+            self.persist_dir.is_some()
+        }
+
+        /// Persistence counters as a dict, or None when persistence is off.
+        #[getter]
+        fn persist_stats<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+            let Some(stats) = self.store.persist_stats() else {
+                return Ok(None);
+            };
+            let d = PyDict::new(py);
+            d.set_item("last_save_ms", stats.last_save_ms)?;
+            d.set_item("snapshot_bytes", stats.snapshot_bytes)?;
+            d.set_item("wal_bytes", stats.wal_bytes)?;
+            d.set_item("loaded_keys", stats.loaded_keys)?;
+            d.set_item("last_error", stats.last_error)?;
+            Ok(Some(d))
         }
 
         // ---- strings ----------------------------------------------------
@@ -581,20 +684,40 @@ mod bindings {
         store: Store,
         host: String,
         configured_port: u16,
+        options: ServerOptions,
         state: Mutex<ServerState>,
     }
 
     #[pymethods]
     impl PyServer {
         #[new]
-        #[pyo3(signature = (cache, host="127.0.0.1", port=6380))]
-        fn new(cache: PyRef<'_, PyCache>, host: &str, port: i64) -> PyResult<Self> {
+        #[pyo3(signature = (cache, host="127.0.0.1", port=6380, password=None))]
+        fn new(
+            cache: PyRef<'_, PyCache>,
+            host: &str,
+            port: i64,
+            password: Option<&Bound<'_, PyAny>>,
+        ) -> PyResult<Self> {
             let port = u16::try_from(port)
                 .map_err(|_| PyValueError::new_err("port must be between 0 and 65535"))?;
+            let password = match password {
+                None => None,
+                Some(p) => {
+                    let s = p
+                        .downcast::<PyString>()
+                        .map_err(|_| PyTypeError::new_err("password must be a str"))?;
+                    let text = s.to_cow()?.into_owned();
+                    if text.is_empty() {
+                        return Err(PyValueError::new_err("password must not be empty"));
+                    }
+                    Some(text)
+                }
+            };
             Ok(Self {
                 store: cache.store.clone(),
                 host: host.to_owned(),
                 configured_port: port,
+                options: ServerOptions { password },
                 state: Mutex::new(ServerState {
                     handle: None,
                     last_port: port,
@@ -610,13 +733,18 @@ mod bindings {
                 if st.handle.is_some() {
                     return Ok(());
                 }
-                let handle = server::start(self.store.clone(), &self.host, self.configured_port)
-                    .map_err(|e| {
-                        PyOSError::new_err(format!(
-                            "cannot bind {}:{}: {e}",
-                            self.host, self.configured_port
-                        ))
-                    })?;
+                let handle = server::start_with_options(
+                    self.store.clone(),
+                    &self.host,
+                    self.configured_port,
+                    self.options.clone(),
+                )
+                .map_err(|e| {
+                    PyOSError::new_err(format!(
+                        "cannot bind {}:{}: {e}",
+                        self.host, self.configured_port
+                    ))
+                })?;
                 st.last_port = handle.port();
                 st.handle = Some(handle);
                 Ok(())
@@ -665,5 +793,13 @@ mod bindings {
 fn _tinycache(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<bindings::PyCache>()?;
     m.add_class::<bindings::PyServer>()?;
+    m.add(
+        "CacheLockedError",
+        m.py().get_type::<bindings::CacheLockedError>(),
+    )?;
+    m.add(
+        "CorruptDataError",
+        m.py().get_type::<bindings::CorruptDataError>(),
+    )?;
     Ok(())
 }

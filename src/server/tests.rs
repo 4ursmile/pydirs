@@ -352,3 +352,223 @@ fn drop_stops_server() {
     drop(handle);
     assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
 }
+
+// ---- persistence and auth (PLAN.md 4d) ------------------------------------
+
+fn tempdir(name: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "tc-server-{name}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn persistent_server(dir: &std::path::Path, password: Option<&str>) -> (super::ServerHandle, u16) {
+    let store = Store::open(Config {
+        sweep_interval_ms: 0,
+        persist: Some(crate::core::PersistConfig {
+            dir: dir.to_path_buf(),
+            fsync: crate::core::FsyncPolicy::Never,
+            snapshot_interval_secs: 0,
+        }),
+        ..Config::default()
+    })
+    .expect("open");
+    let opts = super::ServerOptions {
+        password: password.map(str::to_string),
+    };
+    let handle = super::start_with_options(store, "127.0.0.1", 0, opts).expect("bind");
+    let port = handle.port();
+    (handle, port)
+}
+
+/// Polls INFO until the background save has finished, or fails after a timeout.
+fn wait_for_bgsave(c: &mut Client) {
+    for _ in 0..500 {
+        let info = c.cmd(&[b"INFO"]);
+        if info.contains("last_save_time:") && !info.contains("last_save_time:0\r\n") {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("background save never completed");
+}
+
+#[test]
+fn save_lastsave_and_info_over_tcp() {
+    let dir = tempdir("save");
+    let (_h, port) = persistent_server(&dir, None);
+    let mut c = Client::connect(port);
+    assert_eq!(c.cmd(&[b"LASTSAVE"]), ":0\r\n", "no save yet");
+    assert_eq!(c.cmd(&[b"SET", b"k", b"v"]), "+OK\r\n");
+    assert_eq!(c.cmd(&[b"SAVE"]), "+OK\r\n");
+    let last = c.cmd(&[b"LASTSAVE"]);
+    assert!(last.starts_with(':') && last != ":0\r\n", "{last}");
+    assert!(dir.join("snapshot.tcs").exists());
+
+    let info = c.cmd(&[b"INFO"]);
+    for section in ["# Server", "# Memory", "# Keyspace", "# Persistence"] {
+        assert!(info.contains(section), "missing {section}: {info}");
+    }
+    assert!(info.contains("uptime_in_seconds:"));
+    assert!(info.contains("used_memory:"));
+    assert!(info.contains("keys:1\r\n"), "{info}");
+    assert!(info.contains("persistence_enabled:1"));
+    assert!(info.contains("last_error:\r\n"), "{info}");
+}
+
+#[test]
+fn bgsave_starts_and_completes() {
+    let dir = tempdir("bgsave");
+    let (_h, port) = persistent_server(&dir, None);
+    let mut c = Client::connect(port);
+    assert_eq!(c.cmd(&[b"SET", b"k", b"v"]), "+OK\r\n");
+    assert_eq!(c.cmd(&[b"BGSAVE"]), "+Background saving started\r\n");
+    wait_for_bgsave(&mut c);
+    assert!(dir.join("snapshot.tcs").exists());
+}
+
+#[test]
+fn bgsave_while_running_is_refused() {
+    let dir = tempdir("bgsave-busy");
+    let (_h, port) = persistent_server(&dir, None);
+    let mut c = Client::connect(port);
+    // Keep a save busy by filling the store, then ask for a second one immediately.
+    for i in 0..20_000 {
+        c.send(&encode(&[b"SET", format!("k{i}").as_bytes(), &[b'x'; 64]]));
+    }
+    let mut replies = String::new();
+    for _ in 0..20_000 {
+        replies.push_str(&c.read_reply());
+    }
+    assert!(!replies.contains("-ERR"), "setup failed");
+    let first = c.cmd(&[b"BGSAVE"]);
+    let second = c.cmd(&[b"BGSAVE"]);
+    assert_eq!(first, "+Background saving started\r\n");
+    // The first save may already have finished; if it has not, the second must be refused.
+    // Either way the server answers without error and never runs two at once.
+    assert!(
+        second == "+Background saving started\r\n"
+            || second == "-ERR Background save already in progress\r\n",
+        "{second}"
+    );
+    wait_for_bgsave(&mut c);
+}
+
+#[test]
+fn save_without_persistence_is_an_error_over_tcp() {
+    let (_h, port) = server();
+    let mut c = Client::connect(port);
+    assert!(c
+        .cmd(&[b"SAVE"])
+        .starts_with("-ERR persistence is not enabled"));
+    assert!(c
+        .cmd(&[b"BGSAVE"])
+        .starts_with("-ERR persistence is not enabled"));
+    assert!(c.cmd(&[b"INFO"]).contains("persistence_enabled:0"));
+    assert_eq!(c.cmd(&[b"LASTSAVE"]), ":0\r\n");
+}
+
+#[test]
+fn info_section_names_are_present_without_persistence() {
+    let (_h, port) = server();
+    let mut c = Client::connect(port);
+    let info = c.cmd(&[b"INFO"]);
+    assert!(info.contains("# Server\r\n"));
+    assert!(info.contains("# Memory\r\n"));
+    assert!(info.contains("# Keyspace\r\n"));
+    assert!(info.contains("# Persistence\r\n"));
+}
+
+#[test]
+fn auth_required_before_other_commands() {
+    let (_h, port) = persistent_server_auth("s3cret");
+    let mut c = Client::connect(port);
+    assert_eq!(c.cmd(&[b"PING"]), "-NOAUTH Authentication required.\r\n");
+    assert_eq!(
+        c.cmd(&[b"GET", b"k"]),
+        "-NOAUTH Authentication required.\r\n"
+    );
+    // Arity errors come after the auth check, so a bad command also gets NOAUTH.
+    assert_eq!(c.cmd(&[b"GET"]), "-NOAUTH Authentication required.\r\n");
+    assert_eq!(c.cmd(&[b"AUTH", b"s3cret"]), "+OK\r\n");
+    assert_eq!(c.cmd(&[b"PING"]), "+PONG\r\n");
+}
+
+#[test]
+fn auth_wrong_password_is_rejected_and_keeps_locked() {
+    let (_h, port) = persistent_server_auth("s3cret");
+    let mut c = Client::connect(port);
+    assert_eq!(
+        c.cmd(&[b"AUTH", b"nope"]),
+        "-WRONGPASS invalid password\r\n"
+    );
+    assert_eq!(c.cmd(&[b"PING"]), "-NOAUTH Authentication required.\r\n");
+    assert_eq!(c.cmd(&[b"AUTH", b"s3cret"]), "+OK\r\n");
+    assert_eq!(c.cmd(&[b"PING"]), "+PONG\r\n");
+}
+
+#[test]
+fn auth_is_per_connection() {
+    let (_h, port) = persistent_server_auth("s3cret");
+    let mut a = Client::connect(port);
+    assert_eq!(a.cmd(&[b"AUTH", b"s3cret"]), "+OK\r\n");
+    let mut b = Client::connect(port);
+    assert_eq!(b.cmd(&[b"PING"]), "-NOAUTH Authentication required.\r\n");
+    assert_eq!(a.cmd(&[b"PING"]), "+PONG\r\n");
+}
+
+#[test]
+fn quit_works_before_auth() {
+    let (_h, port) = persistent_server_auth("s3cret");
+    let mut c = Client::connect(port);
+    assert_eq!(c.cmd(&[b"QUIT"]), "+OK\r\n");
+}
+
+#[test]
+fn auth_without_configured_password_returns_redis_error() {
+    let (_h, port) = server();
+    let mut c = Client::connect(port);
+    assert_eq!(
+        c.cmd(&[b"AUTH", b"anything"]),
+        "-ERR AUTH <password> called without any password configured\r\n"
+    );
+    // No password set: other commands work without authenticating, as before.
+    assert_eq!(c.cmd(&[b"PING"]), "+PONG\r\n");
+    assert_eq!(c.cmd(&[b"SET", b"k", b"v"]), "+OK\r\n");
+}
+
+#[test]
+fn no_password_path_is_unchanged_by_options() {
+    let store = Store::new(Config {
+        sweep_interval_ms: 0,
+        ..Config::default()
+    });
+    let handle = super::start_with_options(store, "127.0.0.1", 0, super::ServerOptions::default())
+        .expect("bind");
+    let mut c = Client::connect(handle.port());
+    assert_eq!(c.cmd(&[b"PING"]), "+PONG\r\n");
+}
+
+fn persistent_server_auth(password: &str) -> (super::ServerHandle, u16) {
+    let store = Store::new(Config {
+        sweep_interval_ms: 0,
+        ..Config::default()
+    });
+    let handle = super::start_with_options(
+        store,
+        "127.0.0.1",
+        0,
+        super::ServerOptions {
+            password: Some(password.to_string()),
+        },
+    )
+    .expect("bind");
+    let port = handle.port();
+    (handle, port)
+}

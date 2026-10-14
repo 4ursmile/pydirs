@@ -53,7 +53,11 @@ Reads return `bytes` by default. Pass `Cache(decode=True)` to get `str` back.
 | JSON | `set_json`, `get_json`, `mget_json`, `mset_json`, `hset_json`, `hget_json`, `lpush_json`, `rpush_json`, `lrange_json`, `Cache(serializer="json")` |
 | Sugar | `c[k] = v`, `c[k]`, `del c[k]`, `k in c` |
 | Decorator | `@c.memoize(ttl=...)` |
-| Server | `Server(cache=c, host=..., port=...)`, `start()`, `stop()`, `port` |
+| Pydantic | `set_model`, `get_model`, `mget_model`, `hset_model`, `hget_model`, `@c.memoize` returning model instances |
+| Persistence | `Cache(persist_dir=..., fsync=..., snapshot_interval=...)`, `save()`, `persistent`, `persist_stats` |
+| Server | `Server(cache=c, host=..., port=..., password=...)`, `start()`, `stop()`, `port`, `running` |
+| Client | `Client(host, port, password, timeout, pool_size)`, same methods as `Cache`, `pipeline()`, `ping()`, `info()`, `save()`, `bgsave()`, `lastsave()` |
+| CLI | `tinycache-server` / `python -m tinycache` |
 
 Full signatures, return values and error behaviour are in
 [docs/api.md](docs/api.md).
@@ -219,15 +223,13 @@ so existing Redis clients can connect to it.
 from tinycache import Cache, Server
 
 cache = Cache()
-server = Server(cache=cache, host="127.0.0.1", port=6380)
-server.start()          # runs in a background thread
-print("listening on", server.port)
-
-# ... later
-server.stop()
+with Server(cache, host="127.0.0.1", port=6380) as srv:   # starts; stops on exit
+    print("listening on", srv.port)
+    ...
 ```
 
-Connect with `redis-py`:
+`srv.port` is the port actually bound, so `port=0` works. Connect with
+`redis-py`:
 
 ```python
 import redis
@@ -239,16 +241,139 @@ r.hset("user:1", mapping={"name": "Ada"})
 print(r.hgetall("user:1"))
 ```
 
-Supported commands: `PING`, `GET`, `SET` (with `EX`, `PX`, `NX`, `XX`), `DEL`,
-`EXISTS`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `INCR`, `INCRBY`, `DECR`, `MGET`,
-`MSET`, `KEYS`, `DBSIZE`, `FLUSHALL`, `HSET`, `HGET`, `HDEL`, `HGETALL`, `LPUSH`,
+Supported commands: `PING`, `ECHO`, `GET`, `SET` (with `EX`, `PX`, `NX`, `XX`),
+`SETEX`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `PERSIST`, `TTL`, `PTTL`, `INCR`,
+`INCRBY`, `DECR`, `DECRBY`, `APPEND`, `MGET`, `MSET`, `KEYS`, `DBSIZE`,
+`FLUSHALL`, `FLUSHDB`, `HSET`, `HGET`, `HDEL`, `HGETALL`, `HLEN`, `LPUSH`,
 `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `SADD`, `SREM`, `SMEMBERS`,
-`SISMEMBER`, `QUIT`.
+`SISMEMBER`, `SCARD`, `SELECT` (database 0 only), `COMMAND`, `AUTH`, `INFO`,
+`SAVE`, `BGSAVE`, `LASTSAVE`, `QUIT`. With a password set, every command except
+`AUTH` and `QUIT` needs an authenticated connection (`NOAUTH` otherwise).
 
 The server uses one thread per connection and the standard library only. It is
-intended for development, testing and local tooling, not as a hardened
-production network service. Bind to `127.0.0.1` unless you know what you are
-doing.
+for development, testing and local tooling, not a hardened production network
+service. Bind to `127.0.0.1`.
+
+## Persistence
+
+By default a cache lives only in memory. Pass `persist_dir` to keep it on disk:
+the data is reloaded when the cache is opened again.
+
+```python
+from tinycache import Cache
+
+with Cache(persist_dir="/tmp/tc-demo", fsync="everysec") as c:
+    c.set("greeting", "hello")
+    c.hset("user:1", "name", "Ada")
+    c.save()                        # snapshot now, optional
+    print(c.persist_stats["snapshot_bytes"])
+
+# A later run (or process) sees the same data.
+with Cache(persist_dir="/tmp/tc-demo") as c:
+    print(c.get("greeting"))        # b'hello'
+```
+
+Leaving the `with` block writes a final snapshot. `fsync` picks when WAL writes
+are flushed to disk (`always`, `everysec` or `never`). Background snapshots run
+every `snapshot_interval` seconds (default 300) when there are unsaved writes.
+
+Read [docs/persistence.md](docs/persistence.md) before relying on it. In brief:
+
+- A process kill (SIGKILL) is recovered. Power-loss durability is **not
+  verified** for any fsync policy.
+- A damaged snapshot makes the open fail with `CorruptDataError`. The store does
+  not fall back to older data.
+- Only one process may own a persist directory. Others should use `Client`.
+- Single node only. Persistence does not replicate the data.
+
+### Run as a service
+
+Run the server with a data directory and a password, and let clients connect:
+
+```bash
+export TINYCACHE_PASSWORD='choose-a-long-password'
+tinycache-server --host 0.0.0.0 --port 6380 --dir /var/lib/tinycache \
+    --fsync everysec --snapshot-interval 300
+```
+
+A public bind needs a password, and the server refuses to start without one.
+Clients then authenticate:
+
+```python
+from tinycache import Client
+
+client = Client(host="10.0.0.5", port=6380, password="choose-a-long-password")
+client.set("answer", 42)
+print(client.get("answer"))         # b'42'
+print(client.info("persistence"))   # dict of persistence stats
+client.bgsave()
+```
+
+A `systemd` unit and a Dockerfile are in
+[docs/persistence.md](docs/persistence.md#running-as-a-service-untested-examples).
+They are untested examples.
+
+## Sharing a cache between processes
+
+A `Cache` lives inside one process, so workers in different processes do not
+see each other's data. To share it, run a server once and connect each worker
+with `tinycache.Client`, which has the same methods as `Cache`.
+
+```bash
+tinycache-server --port 6380 --max-memory 256mb --policy allkeys-lru
+# or: python -m tinycache --port 6380
+```
+
+The command prints a banner with the bound port and runs until Ctrl-C or
+SIGTERM. Run `tinycache-server --help` for all options. Binding a non-loopback
+address is refused unless you pass `--allow-insecure`, because password
+enforcement is not available in this release.
+
+```python
+from tinycache import Client
+
+client = Client(host="127.0.0.1", port=6380, pool_size=8, timeout=5.0)
+client.set("answer", 42, ex=30)
+client.get("answer")              # b'42'
+
+with client.pipeline() as p:      # several commands, one write
+    p.set("a", 1).incr("n").hset("h", "f", "v")
+print(p.results)                  # [True, 1, True]
+```
+
+A `Client` is thread-safe and pools its connections. Idempotent commands (reads,
+plain `SET`, `EXPIRE`, `FLUSHALL`) are retried once after a dropped connection,
+so a server restart is usually invisible. Commands that change data
+non-idempotently (`INCR`, `APPEND`, `LPUSH`, `LPOP`, `DEL`, `HSET`, and so on)
+are never retried, so a failed one raises `ConnectionError` and may or may not
+have run. Full rules and error mapping are in [docs/api.md](docs/api.md#client).
+
+### Gunicorn and uvicorn workers
+
+Start the server first, then give each worker its own `Client`. Create the
+client after the worker forks, so no socket is shared across processes.
+
+```python
+# gunicorn.conf.py or app module
+from tinycache import Client
+
+_client = None
+
+def get_client():
+    global _client
+    if _client is None:
+        _client = Client(host="127.0.0.1", port=6380)
+    return _client
+```
+
+```bash
+gunicorn -w 4 myapp:app
+uvicorn myapp:app --workers 4
+```
+
+`myapp` must call `get_client()` from request handlers (or from a `post_fork`
+hook in gunicorn), not at import time, so each worker opens its own
+connections.
 
 ## Performance
 
@@ -290,11 +415,14 @@ local calls because there is no network; GIL released so threads run in
 parallel; one abi3 wheel covers Python 3.9 to 3.14; small binary; JSON and
 pydantic helpers and `memoize` built in; optional RESP2 server for redis clients.
 
-Cons: not a distributed or persistent store (no replication, clustering, disk
-persistence, pub/sub or Lua); the cache is per process, so workers do not share
-it unless you run the server; pipelined SET and INCR over the server are 3 to 4
-times slower than Redis; memory use is about 1.5x Redis for small keys; a plain `dict` is about 3 to 5 times faster for a
-single-process cache with no TTL needs; far less mature and tested than Redis.
+Cons: single node only (no replication, clustering, failover, pub/sub or Lua).
+Persistence is opt-in and writes to one local directory, and its durability
+limits are documented in [docs/persistence.md](docs/persistence.md). A `Cache`
+is per process, so workers share data only through a running server.
+Pipelined SET and INCR over the server are 3 to 4 times slower than Redis. Memory
+use is about 1.5 times Redis for small keys. A plain `dict` is about 3 to 5 times
+faster for a single-process cache with no TTL needs. The project is far less
+mature and tested than Redis.
 
 ## Supported platforms
 
@@ -321,13 +449,14 @@ cargo clippy --no-default-features --all-targets -- -D warnings
 cargo test --no-default-features
 
 # Python
-pip install maturin pytest
+pip install maturin "pytest>=7" pytest-asyncio pydantic
 maturin develop --release
-pytest
+pytest -m "not leak"
 ```
 
-Memory-leak tests carry the `leak` pytest marker. A plain `pytest` run includes
-them. To run only the leak tests:
+Memory-leak tests carry the `leak` pytest marker. The CI `test` job runs
+`pytest -m "not leak"`, and a separate `leaks` job runs `pytest -m leak` on Linux.
+A plain `pytest` run includes them as well. To run only the leak tests:
 
 ```bash
 pytest -m leak

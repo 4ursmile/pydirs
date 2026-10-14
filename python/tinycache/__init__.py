@@ -12,7 +12,8 @@ from __future__ import annotations
 from importlib import metadata as _metadata
 
 from ._cache import Cache
-from ._client import Client, ResponseError
+from ._client import AuthenticationError, Client, ResponseError
+from ._tinycache import CacheLockedError, CorruptDataError
 from ._serializers import JsonSerializer, PydanticSerializer, Serializer
 from ._server import Server
 
@@ -22,8 +23,11 @@ except _metadata.PackageNotFoundError:  # pragma: no cover - source checkout wit
     __version__ = "0.0.0+unknown"
 
 __all__ = [
+    "AuthenticationError",
     "Cache",
+    "CacheLockedError",
     "Client",
+    "CorruptDataError",
     "JsonSerializer",
     "PydanticSerializer",
     "ResponseError",

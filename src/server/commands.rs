@@ -1,8 +1,13 @@
 //! Command table and dispatch from RESP argument lists onto [`Store`].
 
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::Arc;
+use std::thread;
+
 use crate::core::{Store, StoreError};
 
 use super::resp::Reply;
+use super::{Ctx, Session};
 
 /// Handler result. `Err` carries the error reply to send, so `?` works in handlers.
 type Out = Result<Reply, Reply>;
@@ -21,12 +26,25 @@ impl From<StoreError> for Reply {
     }
 }
 
-/// Runs one command. Returns the reply and whether the connection should close.
-pub(crate) fn dispatch(store: &Store, args: &[Vec<u8>]) -> (Reply, bool) {
+/// Runs one command for a connection. Returns the reply and whether the connection should
+/// close. Until the session is authenticated, only `AUTH` and `QUIT` are accepted.
+pub(crate) fn dispatch(ctx: &Ctx, session: &mut Session, args: &[Vec<u8>]) -> (Reply, bool) {
     let Some(first) = args.first() else {
         return (Reply::Error("ERR empty command".into()), false);
     };
     let name = first.to_ascii_uppercase();
+    if name == b"QUIT" {
+        return (Reply::Simple("OK".into()), true);
+    }
+    if name == b"AUTH" {
+        return (auth(ctx, session, args), false);
+    }
+    if !session.authed {
+        return (
+            Reply::Error("NOAUTH Authentication required.".into()),
+            false,
+        );
+    }
     let Some((min, max)) = arity(&name) else {
         let shown = String::from_utf8_lossy(first);
         return (
@@ -37,13 +55,40 @@ pub(crate) fn dispatch(store: &Store, args: &[Vec<u8>]) -> (Reply, bool) {
     if args.len() < min || args.len() > max {
         return (wrong_args(first), false);
     }
-    if name == b"QUIT" {
-        return (Reply::Simple("OK".into()), true);
-    }
-    let reply = match execute(store, args, &name) {
+    let reply = match execute(ctx, args, &name) {
         Ok(reply) | Err(reply) => reply,
     };
     (reply, false)
+}
+
+/// `AUTH password`. Compares in constant time with respect to the password's contents.
+fn auth(ctx: &Ctx, session: &mut Session, args: &[Vec<u8>]) -> Reply {
+    if args.len() != 2 {
+        return wrong_args(&args[0]);
+    }
+    let Some(expected) = ctx.password.as_deref() else {
+        return Reply::Error("ERR AUTH <password> called without any password configured".into());
+    };
+    if ct_eq(expected.as_bytes(), &args[1]) {
+        session.authed = true;
+        Reply::Simple("OK".into())
+    } else {
+        session.authed = false;
+        Reply::Error("WRONGPASS invalid password".into())
+    }
+}
+
+/// Equality that always scans the longer of the two inputs, so the time taken does not reveal
+/// where the first mismatch is. A length mismatch is still reported, which leaks only the length.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len().max(b.len());
+    let mut diff = (a.len() ^ b.len()) as u32;
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= u32::from(x ^ y);
+    }
+    diff == 0
 }
 
 /// `(min, max)` argument counts including the command name.
@@ -65,13 +110,20 @@ fn arity(name: &[u8]) -> Option<(usize, usize)> {
         b"FLUSHALL" | b"FLUSHDB" => (1, 2),
         b"HSET" => (4, V),
         b"COMMAND" => (1, V),
+        b"SAVE" | b"BGSAVE" | b"LASTSAVE" => (1, 1),
+        b"INFO" => (1, 2),
         b"QUIT" => (1, 1),
         _ => return None,
     })
 }
 
-fn execute(store: &Store, args: &[Vec<u8>], name: &[u8]) -> Out {
+fn execute(ctx: &Ctx, args: &[Vec<u8>], name: &[u8]) -> Out {
+    let store = &ctx.store;
     match name {
+        b"SAVE" => save(store),
+        b"BGSAVE" => bgsave(ctx),
+        b"LASTSAVE" => Ok(Reply::Int(last_save_secs(store))),
+        b"INFO" => Ok(Reply::Bulk(info(ctx).into_bytes())),
         b"PING" => Ok(if args.len() == 2 {
             Reply::Bulk(args[1].clone())
         } else {
@@ -257,6 +309,91 @@ fn hset(store: &Store, args: &[Vec<u8>]) -> Out {
         }
     }
     Ok(Reply::Int(added))
+}
+
+fn persistence_disabled() -> Reply {
+    Reply::Error("ERR persistence is not enabled for this server".into())
+}
+
+fn save(store: &Store) -> Out {
+    if store.persist_stats().is_none() {
+        return Err(persistence_disabled());
+    }
+    match store.save() {
+        Ok(()) => Ok(Reply::Simple("OK".into())),
+        Err(e) => Err(Reply::Error(format!("ERR save failed: {e}"))),
+    }
+}
+
+/// Starts a snapshot on a background thread. Refuses if one is already running. The thread
+/// clears the running flag when it finishes, whatever the outcome.
+fn bgsave(ctx: &Ctx) -> Out {
+    if ctx.store.persist_stats().is_none() {
+        return Err(persistence_disabled());
+    }
+    if ctx
+        .bgsave_running
+        .compare_exchange(false, true, SeqCst, SeqCst)
+        .is_err()
+    {
+        return Err(Reply::Error(
+            "ERR Background save already in progress".into(),
+        ));
+    }
+    let store = ctx.store.clone();
+    let running = Arc::clone(&ctx.bgsave_running);
+    let spawned = thread::Builder::new()
+        .name("tinycache-bgsave".into())
+        .spawn(move || {
+            let _ = store.save();
+            running.store(false, SeqCst);
+        });
+    match spawned {
+        Ok(_) => Ok(Reply::Simple("Background saving started".into())),
+        Err(e) => {
+            ctx.bgsave_running.store(false, SeqCst);
+            Err(Reply::Error(format!(
+                "ERR cannot start background save: {e}"
+            )))
+        }
+    }
+}
+
+/// Unix time of the last successful save, in seconds. Zero if none has happened.
+fn last_save_secs(store: &Store) -> i64 {
+    store
+        .persist_stats()
+        .map_or(0, |s| (s.last_save_ms / 1000) as i64)
+}
+
+/// The INFO text, one `key:value` per line under `# Section` headers.
+fn info(ctx: &Ctx) -> String {
+    let store = &ctx.store;
+    let mut out = String::new();
+    out.push_str("# Server\r\n");
+    out.push_str(&format!(
+        "uptime_in_seconds:{}\r\n",
+        ctx.started.elapsed().as_secs()
+    ));
+    out.push_str("\r\n# Memory\r\n");
+    out.push_str(&format!("used_memory:{}\r\n", store.used_memory()));
+    out.push_str("\r\n# Keyspace\r\n");
+    out.push_str(&format!("keys:{}\r\n", store.dbsize()));
+    out.push_str("\r\n# Persistence\r\n");
+    match store.persist_stats() {
+        None => out.push_str("persistence_enabled:0\r\n"),
+        Some(st) => {
+            out.push_str("persistence_enabled:1\r\n");
+            out.push_str(&format!("last_save_time:{}\r\n", st.last_save_ms / 1000));
+            out.push_str(&format!("wal_bytes:{}\r\n", st.wal_bytes));
+            out.push_str(&format!("snapshot_bytes:{}\r\n", st.snapshot_bytes));
+            out.push_str(&format!(
+                "last_error:{}\r\n",
+                st.last_error.as_deref().unwrap_or("")
+            ));
+        }
+    }
+    out
 }
 
 fn refs(args: &[Vec<u8>]) -> Vec<&[u8]> {

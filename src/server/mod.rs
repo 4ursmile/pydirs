@@ -19,6 +19,29 @@ use std::time::Duration;
 use crate::core::Store;
 use resp::{ProtoError, Reply};
 
+/// Options for [`start_with_options`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerOptions {
+    /// When set, every connection must send `AUTH <password>` before any other command
+    /// except `QUIT`. With no password, `AUTH` is refused as in Redis.
+    pub password: Option<String>,
+}
+
+/// Server-wide state shared by every connection.
+pub(crate) struct Ctx {
+    pub(crate) store: Store,
+    pub(crate) password: Option<String>,
+    pub(crate) started: std::time::Instant,
+    /// True while a BGSAVE thread is running. Set before the thread starts, cleared by it.
+    pub(crate) bgsave_running: Arc<AtomicBool>,
+}
+
+/// Per-connection state.
+#[derive(Default)]
+pub(crate) struct Session {
+    pub(crate) authed: bool,
+}
+
 /// Handle to a running server. Dropping it stops the server.
 pub struct ServerHandle {
     port: u16,
@@ -75,6 +98,17 @@ impl Drop for ServerHandle {
 /// Binds `host:port` and starts serving `store` in background threads.
 /// Port 0 picks a free port; read it back with [`ServerHandle::port`].
 pub fn start(store: Store, host: &str, port: u16) -> io::Result<ServerHandle> {
+    start_with_options(store, host, port, ServerOptions::default())
+}
+
+/// Like [`start`], with options such as a password. With the default options it behaves
+/// exactly like `start`.
+pub fn start_with_options(
+    store: Store,
+    host: &str,
+    port: u16,
+    opts: ServerOptions,
+) -> io::Result<ServerHandle> {
     let listener = TcpListener::bind((host, port))?;
     let local = listener.local_addr()?;
     let ip = if local.ip().is_unspecified() {
@@ -90,9 +124,15 @@ pub fn start(store: Store, host: &str, port: u16) -> io::Result<ServerHandle> {
         conns: Mutex::new(Vec::new()),
     });
     let accept_shared = Arc::clone(&shared);
+    let ctx = Arc::new(Ctx {
+        store,
+        password: opts.password,
+        started: std::time::Instant::now(),
+        bgsave_running: Arc::new(AtomicBool::new(false)),
+    });
     let handle = thread::Builder::new()
         .name("tinycache-accept".into())
-        .spawn(move || accept_loop(&listener, &store, &accept_shared))?;
+        .spawn(move || accept_loop(&listener, &ctx, &accept_shared))?;
     Ok(ServerHandle {
         port: local.port(),
         wake_addr: SocketAddr::new(ip, local.port()),
@@ -105,7 +145,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn accept_loop(listener: &TcpListener, store: &Store, shared: &Shared) {
+fn accept_loop(listener: &TcpListener, ctx: &Arc<Ctx>, shared: &Shared) {
     loop {
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
@@ -126,10 +166,10 @@ fn accept_loop(listener: &TcpListener, store: &Store, shared: &Shared) {
         let Ok(shutdown_handle) = stream.try_clone() else {
             continue;
         };
-        let store = store.clone();
+        let ctx = Arc::clone(ctx);
         let spawned = thread::Builder::new()
             .name("tinycache-conn".into())
-            .spawn(move || serve(stream, &store));
+            .spawn(move || serve(stream, &ctx));
         if let Ok(handle) = spawned {
             conns.push(Conn {
                 stream: shutdown_handle,
@@ -152,13 +192,16 @@ fn reap_finished(conns: &mut Vec<Conn>) {
     }
 }
 
-fn serve(stream: TcpStream, store: &Store) {
+fn serve(stream: TcpStream, ctx: &Ctx) {
     let _ = stream.set_nodelay(true);
     let Ok(read_half) = stream.try_clone() else {
         return;
     };
     let mut reader = BufReader::new(read_half);
     let mut writer = BufWriter::new(stream);
+    let mut session = Session {
+        authed: ctx.password.is_none(),
+    };
     loop {
         let args = match resp::read_command(&mut reader) {
             Ok(Some(args)) => args,
@@ -170,7 +213,7 @@ fn serve(stream: TcpStream, store: &Store) {
             }
         };
         if !args.is_empty() {
-            let (reply, close) = commands::dispatch(store, &args);
+            let (reply, close) = commands::dispatch(ctx, &mut session, &args);
             if resp::write_reply(&mut writer, &reply).is_err() || close {
                 break;
             }
