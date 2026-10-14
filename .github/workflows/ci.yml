@@ -1,9 +1,9 @@
 name: CI
 
+# Runs only when a GitHub Release is created, not on every push or pull request.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  release:
+    types: [created]
 
 permissions:
   contents: read
@@ -53,7 +53,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install build and test tools
+      - name: Create virtualenv
+        shell: bash
+        run: |
+          python -m venv .venv
+          if [ -d .venv/Scripts ]; then echo "$PWD/.venv/Scripts" >> "$GITHUB_PATH"; else echo "$PWD/.venv/bin" >> "$GITHUB_PATH"; fi
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+
+      - name: Install build and test tools (venv)
         run: pip install maturin "pytest>=7" pytest-asyncio
 
       - name: Build and install extension (release)
@@ -116,6 +123,10 @@ jobs:
 
       - name: Build and install extension (release)
         run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+          . .venv/bin/activate
           pip install maturin "pytest>=7" pytest-asyncio pydantic
           maturin develop --release
 

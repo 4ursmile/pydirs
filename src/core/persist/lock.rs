@@ -4,7 +4,7 @@
 //! file is taken over only when its pid is not alive (or it is this process's pid and no
 //! live handle in this process holds it, which is what a SIGKILLed test store looks like).
 //! A file that is empty or unparsable is treated as stale. Within one process, a second
-//! `acquire` on a held directory always fails.
+//! `acquire` on a held directory fails once a short grace period for a late release passes.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -12,9 +12,14 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Directories currently held by a live `LockFile` in this process (canonical paths).
 static HELD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// How long `acquire` waits for another handle in this process to release a directory.
+const RELEASE_GRACE: Duration = Duration::from_secs(2);
 
 pub(crate) const LOCK_FILE: &str = "LOCK";
 
@@ -39,8 +44,17 @@ impl LockFile {
         let key = dir.canonicalize()?;
         let path = dir.join(LOCK_FILE);
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-        if held.contains(&key) {
-            return Err(would_block());
+        // A store dropped a moment ago may still be held by its sweeper thread, which owns
+        // the last reference until its current tick ends and then releases the lock. Wait
+        // briefly for that instead of failing a reopen that is about to succeed.
+        let deadline = Instant::now() + RELEASE_GRACE;
+        while held.contains(&key) {
+            if Instant::now() >= deadline {
+                return Err(would_block());
+            }
+            drop(held);
+            thread::sleep(Duration::from_millis(5));
+            held = HELD.lock().unwrap_or_else(|e| e.into_inner());
         }
         for _ in 0..3 {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
