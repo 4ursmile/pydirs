@@ -53,18 +53,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Create virtualenv
-        shell: bash
-        run: |
-          python -m venv .venv
-          if [ -d .venv/Scripts ]; then echo "$PWD/.venv/Scripts" >> "$GITHUB_PATH"; else echo "$PWD/.venv/bin" >> "$GITHUB_PATH"; fi
-          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
-
-      - name: Install build and test tools (venv)
+      - name: Install build and test tools
         run: pip install maturin "pytest>=7" pytest-asyncio
 
-      - name: Build and install extension (release)
-        run: maturin develop --release
+      # `maturin develop` needs a venv and mis-detects the interpreter inside one on Windows,
+      # so build a wheel against the setup-python interpreter and install it.
+      - name: Build wheel (release)
+        run: maturin build --release --out dist
+
+      - name: Install wheel
+        run: pip install --no-index --find-links dist tinycache-rs
 
       # No version pin: pip resolves a pydantic release that supports each Python in the matrix.
       - name: Install pydantic (optional extra, exercised by tests)

@@ -141,6 +141,10 @@ jobs:
     name: Publish to PyPI
     needs: [check-version, build-wheels, build-sdist, smoke-test]
     runs-on: ubuntu-latest
+    permissions:
+      # Needed for PyPI trusted publishing (OIDC). Also harmless with an API token.
+      id-token: write
+      contents: read
     steps:
       - uses: actions/download-artifact@v4
         with:

@@ -70,12 +70,16 @@ impl ServerHandle {
     /// Stops accepting, closes every client socket and joins all threads.
     /// Safe to call more than once.
     pub fn stop(&self) {
-        if !self.shared.stopping.swap(true, SeqCst) {
-            // Wake the blocked accept() with a throwaway connection. The accept
-            // loop sees the flag, exits and drops the listener.
-            let _ = TcpStream::connect_timeout(&self.wake_addr, Duration::from_secs(1));
-        }
+        self.shared.stopping.store(true, SeqCst);
         if let Some(handle) = lock(&self.accept).take() {
+            // Wake the blocked accept() with a throwaway connection. The accept loop sees
+            // the flag, exits and drops the listener. A single attempt can be lost (a full
+            // backlog, a slow loopback), which would leave join() blocked forever, so keep
+            // knocking until the thread is gone.
+            while !handle.is_finished() {
+                let _ = TcpStream::connect_timeout(&self.wake_addr, Duration::from_secs(1));
+                thread::sleep(Duration::from_millis(20));
+            }
             let _ = handle.join();
         }
         // The accept thread is gone, so no new connection can register after this drain.
