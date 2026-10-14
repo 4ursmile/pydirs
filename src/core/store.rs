@@ -9,7 +9,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use parking_lot::RwLock;
 
 use super::expiry;
-use super::value::{entry_size, Entry, Map, Set, ShardMap, Value, ELEM_OVERHEAD, ENTRY_OVERHEAD};
+use super::value::{
+    alloc_size, coll_base, deadline, elem_size, pair_size, str_entry_size, table_bytes,
+    table_growth, Coll, Collection, Entry, Map, Set, ShardMap,
+};
+
+/// Tables smaller than this are never shrunk; the saving would be negligible.
+const MIN_SHRINK_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
@@ -71,6 +77,8 @@ pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// Shared state behind every `Store` handle.
 pub(crate) struct Inner {
     pub(crate) shards: Box<[RwLock<ShardMap>]>,
+    /// Bytes currently charged to `used` for each shard's bucket array.
+    table_charge: Box<[AtomicUsize]>,
     pub(crate) mask: usize,
     hasher: ahash::RandomState,
     pub(crate) max_memory: usize,
@@ -96,6 +104,20 @@ fn system_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Typed view of a non-string entry, or `WrongType` for strings.
+fn collection(e: &Entry) -> Result<&Collection> {
+    e.coll().map(|c| &c.data).ok_or(StoreError::WrongType)
+}
+
+/// Mutable access to a collection entry's container and cached byte count.
+fn coll_mut(e: &mut Entry) -> Result<&mut Coll> {
+    e.coll_mut().ok_or(StoreError::WrongType)
+}
+
+fn str_value(e: &Entry) -> Result<&[u8]> {
+    e.as_str().ok_or(StoreError::WrongType)
+}
+
 impl Store {
     pub fn new(cfg: Config) -> Store {
         Self::with_clock(cfg, Arc::new(system_now_ms))
@@ -107,8 +129,13 @@ impl Store {
             .map(|_| RwLock::new(ShardMap::default()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let table_charge = (0..n)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let inner = Arc::new(Inner {
             shards,
+            table_charge,
             mask: n - 1,
             hasher: ahash::RandomState::with_seeds(
                 0x243f_6a88_85a3_08d3,
@@ -150,7 +177,8 @@ impl Store {
     ) -> Result<bool> {
         let inner = &self.inner;
         let now = inner.now();
-        let new_size = ENTRY_OVERHEAD + k.len() + v.len();
+        let (_, lock, _) = inner.locate(k);
+        let new_size = str_entry_size(k.len(), v.len()) + inner.insert_growth(lock, k);
         let old_size = inner.live_size(k, now);
         if (nx && old_size.is_some()) || (xx && old_size.is_none()) {
             return Ok(false);
@@ -158,23 +186,21 @@ impl Store {
         inner.reserve(new_size.saturating_sub(old_size.unwrap_or(0)))?;
 
         // The NX/XX condition is re-checked under the write lock so it stays atomic.
-        let mut shard = inner.shard(k).write();
-        inner.purge_locked(&mut shard, k, now);
-        let exists = shard.contains_key(k);
+        let (idx, lock, h) = inner.locate(k);
+        let mut shard = lock.write();
+        inner.purge_locked(&mut shard, idx, h, k, now);
+        let exists = shard.find(h, |e| e.key() == k).is_some();
         if (nx && exists) || (xx && !exists) {
             return Ok(false);
         }
-        let expires_at = ttl_ms.map(|ttl| now.saturating_add(ttl));
-        let entry = inner.new_entry(Value::Bytes(v), expires_at);
-        inner.put_locked(&mut shard, k, entry);
+        let expires_at = ttl_ms.map_or(0, |t| deadline(now, t));
+        let entry = inner.new_entry(k, &v, expires_at);
+        inner.put_locked(&mut shard, idx, h, k, entry);
         Ok(true)
     }
 
     pub fn get(&self, k: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner.read_with(k, |v| match v {
-            Value::Bytes(b) => Ok(Some(b.clone())),
-            _ => Err(StoreError::WrongType),
-        })
+        self.inner.read_key(k, |e| str_value(e).map(<[u8]>::to_vec))
     }
 
     pub fn mget(&self, ks: &[&[u8]]) -> Vec<Option<Vec<u8>>> {
@@ -192,55 +218,52 @@ impl Store {
     pub fn incr_by(&self, k: &[u8], delta: i64) -> Result<i64> {
         let inner = &self.inner;
         let now = inner.now();
-        let growth = if inner.live_size(k, now).is_some() {
-            20
-        } else {
-            ENTRY_OVERHEAD + k.len() + 20
-        };
+        // Longest i64 text is 20 bytes.
+        let (_, lock, _) = inner.locate(k);
+        let growth = (str_entry_size(k.len(), 20) + inner.insert_growth(lock, k))
+            .saturating_sub(inner.live_size(k, now).unwrap_or(0));
         inner.reserve(growth)?;
 
-        let mut shard = inner.shard(k).write();
-        inner.purge_locked(&mut shard, k, now);
-        let (current, expires_at) = match shard.get(k) {
-            None => (0, None),
-            Some(e) => match &e.value {
-                Value::Bytes(b) => (parse_i64(b)?, e.expires_at),
-                _ => return Err(StoreError::WrongType),
-            },
+        let (idx, lock, h) = inner.locate(k);
+        let mut shard = lock.write();
+        inner.purge_locked(&mut shard, idx, h, k, now);
+        let (current, expires_at) = match shard.find(h, |e| e.key() == k) {
+            None => (0, 0),
+            Some(e) => (parse_i64(str_value(e)?)?, e.expires_at),
         };
         let next = current.checked_add(delta).ok_or(StoreError::Overflow)?;
-        let entry = inner.new_entry(Value::Bytes(next.to_string().into_bytes()), expires_at);
-        inner.put_locked(&mut shard, k, entry);
+        let entry = inner.new_entry(k, next.to_string().as_bytes(), expires_at);
+        inner.put_locked(&mut shard, idx, h, k, entry);
         Ok(next)
     }
 
     pub fn append(&self, k: &[u8], v: &[u8]) -> Result<usize> {
         let inner = &self.inner;
         let now = inner.now();
-        let growth = if inner.live_size(k, now).is_some() {
-            v.len()
-        } else {
-            ENTRY_OVERHEAD + k.len() + v.len()
+        let (_, lock, _) = inner.locate(k);
+        let growth = match inner.live_size(k, now) {
+            Some(_) => v.len(),
+            None => str_entry_size(k.len(), v.len()) + inner.insert_growth(lock, k),
         };
         inner.reserve(growth)?;
 
-        let mut shard = inner.shard(k).write();
-        inner.purge_locked(&mut shard, k, now);
-        match shard.get_mut(k) {
-            Some(e) => {
-                inner.stamp(e);
-                let Value::Bytes(b) = &mut e.value else {
-                    return Err(StoreError::WrongType);
-                };
-                b.extend_from_slice(v);
-                inner.charge(v.len());
-                Ok(b.len())
-            }
-            None => {
-                let entry = inner.new_entry(Value::Bytes(v.to_vec()), None);
-                inner.put_locked(&mut shard, k, entry);
-                Ok(v.len())
-            }
+        let (idx, lock, h) = inner.locate(k);
+        let mut shard = lock.write();
+        inner.purge_locked(&mut shard, idx, h, k, now);
+        if let Some(e) = shard.find_mut(h, |e| e.key() == k) {
+            str_value(e)?;
+            inner.stamp(e);
+            let old = e.heap_size();
+            e.append_str(v);
+            let len = str_value(e)?.len();
+            let new = e.heap_size();
+            inner.resize(old, new);
+            inner.settle(idx, &shard);
+            Ok(len)
+        } else {
+            let entry = inner.new_entry(k, v, 0);
+            inner.put_locked(&mut shard, idx, h, k, entry);
+            Ok(v.len())
         }
     }
 
@@ -250,9 +273,10 @@ impl Store {
         let now = self.inner.now();
         let mut removed = 0;
         for &k in ks {
-            let mut shard = self.inner.shard(k).write();
-            self.inner.purge_locked(&mut shard, k, now);
-            if self.inner.remove_locked(&mut shard, k) {
+            let (idx, lock, h) = self.inner.locate(k);
+            let mut shard = lock.write();
+            self.inner.purge_locked(&mut shard, idx, h, k, now);
+            if self.inner.remove_hashed(&mut shard, idx, h, k) {
                 removed += 1;
             }
         }
@@ -266,11 +290,12 @@ impl Store {
 
     pub fn expire_ms(&self, k: &[u8], ttl_ms: u64) -> bool {
         let now = self.inner.now();
-        let mut shard = self.inner.shard(k).write();
-        self.inner.purge_locked(&mut shard, k, now);
-        match shard.get_mut(k) {
+        let (idx, lock, h) = self.inner.locate(k);
+        let mut shard = lock.write();
+        self.inner.purge_locked(&mut shard, idx, h, k, now);
+        match shard.find_mut(h, |e| e.key() == k) {
             Some(e) => {
-                e.expires_at = Some(now.saturating_add(ttl_ms));
+                e.expires_at = deadline(now, ttl_ms);
                 true
             }
             None => false,
@@ -280,11 +305,12 @@ impl Store {
     /// Removes the expiry from `k`. Returns true only if a TTL was actually removed.
     pub fn persist(&self, k: &[u8]) -> bool {
         let now = self.inner.now();
-        let mut shard = self.inner.shard(k).write();
-        self.inner.purge_locked(&mut shard, k, now);
-        match shard.get_mut(k) {
-            Some(e) if e.expires_at.is_some() => {
-                e.expires_at = None;
+        let (idx, lock, h) = self.inner.locate(k);
+        let mut shard = lock.write();
+        self.inner.purge_locked(&mut shard, idx, h, k, now);
+        match shard.find_mut(h, |e| e.key() == k) {
+            Some(e) if e.expires_at != 0 => {
+                e.expires_at = 0;
                 true
             }
             _ => false,
@@ -294,14 +320,13 @@ impl Store {
     /// Remaining time to live in ms: -2 if missing, -1 if the key has no expiry.
     pub fn pttl(&self, k: &[u8]) -> i64 {
         let now = self.inner.now();
-        let shard = self.inner.shard(k).read();
-        match shard.get(k) {
+        let (_, lock, h) = self.inner.locate(k);
+        let shard = lock.read();
+        match shard.find(h, |e| e.key() == k) {
             None => -2,
             Some(e) if e.is_expired(now) => -2,
-            Some(e) => match e.expires_at {
-                None => -1,
-                Some(t) => i64::try_from(t - now).unwrap_or(i64::MAX),
-            },
+            Some(e) if e.expires_at == 0 => -1,
+            Some(e) => i64::try_from(e.expires_at - now).unwrap_or(i64::MAX),
         }
     }
 
@@ -315,8 +340,8 @@ impl Store {
             out.extend(
                 shard
                     .iter()
-                    .filter(|(k, e)| !e.is_expired(now) && glob_match(pattern, k))
-                    .map(|(k, _)| k.to_vec()),
+                    .filter(|e| !e.is_expired(now) && glob_match(pattern, e.key()))
+                    .map(|e| e.key().to_vec()),
             );
         }
         out
@@ -327,16 +352,24 @@ impl Store {
         self.inner
             .shards
             .iter()
-            .map(|lock| lock.read().values().filter(|e| !e.is_expired(now)).count())
+            .map(|lock| lock.read().iter().filter(|e| !e.is_expired(now)).count())
             .sum()
     }
 
+    /// Removes every key. Each shard's table is swapped for an empty one and the old
+    /// table is freed outside the lock, so the memory goes back to the allocator.
     pub fn flush(&self) {
-        for lock in self.inner.shards.iter() {
-            let mut shard = lock.write();
-            let old = std::mem::take(&mut *shard);
-            let freed: usize = old.iter().map(|(k, e)| entry_size(k, e)).sum();
-            self.inner.refund(freed);
+        for (idx, lock) in self.inner.shards.iter().enumerate() {
+            let old = {
+                let mut shard = lock.write();
+                let heap: usize = shard.iter().map(Entry::heap_size).sum();
+                self.inner.refund(heap);
+                let old = std::mem::take(&mut *shard);
+                self.inner.settle(idx, &shard);
+                old
+            };
+            // Free the old bucket array and entries outside the lock.
+            drop(old);
         }
     }
 
@@ -349,67 +382,77 @@ impl Store {
     /// Returns true if the field was newly created.
     pub fn hset(&self, k: &[u8], f: &[u8], v: Vec<u8>) -> Result<bool> {
         let inner = &self.inner;
-        inner.reserve(ENTRY_OVERHEAD + k.len() + f.len() + v.len() + ELEM_OVERHEAD)?;
+        let (_, lock, _) = inner.locate(k);
+        inner.reserve(
+            coll_base(k.len()) + pair_size(f.len(), v.len()) + inner.insert_growth(lock, k),
+        )?;
 
         let now = inner.now();
-        let mut shard = inner.shard(k).write();
-        inner.purge_locked(&mut shard, k, now);
-        let e = inner.entry_or_insert(&mut shard, k, || Value::Hash(Map::default()));
+        let (idx, lock, h) = inner.locate(k);
+        let mut shard = lock.write();
+        inner.purge_locked(&mut shard, idx, h, k, now);
+        let e = inner.coll_entry(&mut shard, h, k, || Collection::Hash(Map::default()));
         inner.stamp(e);
-        let Value::Hash(h) = &mut e.value else {
+        let coll = coll_mut(e)?;
+        let Collection::Hash(map) = &mut coll.data else {
             return Err(StoreError::WrongType);
         };
-        if let Some(old) = h.get_mut(f) {
-            let (old_len, new_len) = (old.len(), v.len());
+        let added = if let Some(old) = map.get_mut(f) {
+            let (old_alloc, new_alloc) = (alloc_size(old.len()), alloc_size(v.len()));
             *old = v;
-            inner.resize(old_len, new_len);
-            Ok(false)
+            inner.coll_resize(&mut coll.bytes, old_alloc, new_alloc);
+            false
         } else {
-            inner.charge(f.len() + v.len() + ELEM_OVERHEAD);
-            h.insert(f.to_vec(), v);
-            Ok(true)
-        }
+            inner.coll_resize(&mut coll.bytes, 0, pair_size(f.len(), v.len()));
+            map.insert(f.to_vec(), v);
+            true
+        };
+        inner.settle(idx, &shard);
+        Ok(added)
     }
 
     pub fn hget(&self, k: &[u8], f: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner.read_with(k, |v| match v {
-            Value::Hash(h) => Ok(h.get(f).cloned()),
+        self.inner.read_with(k, |e| match collection(e)? {
+            Collection::Hash(h) => Ok(h.get(f).cloned()),
             _ => Err(StoreError::WrongType),
         })
     }
 
     pub fn hdel(&self, k: &[u8], fields: &[&[u8]]) -> Result<usize> {
-        let now = self.inner.now();
-        let mut shard = self.inner.shard(k).write();
-        self.inner.purge_locked(&mut shard, k, now);
-        let Some(e) = shard.get_mut(k) else {
+        let inner = &self.inner;
+        let now = inner.now();
+        let (idx, lock, h) = inner.locate(k);
+        let mut shard = lock.write();
+        inner.purge_locked(&mut shard, idx, h, k, now);
+        let Some(e) = shard.find_mut(h, |e| e.key() == k) else {
             return Ok(0);
         };
-        self.inner.stamp(e);
-        let Value::Hash(h) = &mut e.value else {
+        inner.stamp(e);
+        let coll = coll_mut(e)?;
+        let Collection::Hash(map) = &mut coll.data else {
             return Err(StoreError::WrongType);
         };
         let mut removed = 0;
         for f in fields {
-            if let Some(v) = h.remove(*f) {
-                self.inner.refund(f.len() + v.len() + ELEM_OVERHEAD);
+            if let Some((fk, v)) = map.remove_entry(*f) {
+                inner.coll_resize(&mut coll.bytes, pair_size(fk.len(), v.len()), 0);
                 removed += 1;
             }
         }
-        self.inner.drop_if_empty(&mut shard, k);
+        inner.drop_if_empty(&mut shard, idx, h, k);
         Ok(removed)
     }
 
     pub fn hgetall(&self, k: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.inner.read_with(k, |v| match v {
-            Value::Hash(h) => Ok(h.iter().map(|(f, v)| (f.clone(), v.clone())).collect()),
+        self.inner.read_with(k, |e| match collection(e)? {
+            Collection::Hash(h) => Ok(h.iter().map(|(f, v)| (f.clone(), v.clone())).collect()),
             _ => Err(StoreError::WrongType),
         })
     }
 
     pub fn hlen(&self, k: &[u8]) -> Result<usize> {
-        self.inner.read_with(k, |v| match v {
-            Value::Hash(h) => Ok(h.len()),
+        self.inner.read_with(k, |e| match collection(e)? {
+            Collection::Hash(h) => Ok(h.len()),
             _ => Err(StoreError::WrongType),
         })
     }
@@ -427,20 +470,24 @@ impl Store {
 
     fn push(&self, k: &[u8], vs: Vec<Vec<u8>>, front: bool) -> Result<usize> {
         let inner = &self.inner;
-        let growth =
-            ENTRY_OVERHEAD + k.len() + vs.iter().map(|v| v.len() + ELEM_OVERHEAD).sum::<usize>();
+        let (_, lock, _) = inner.locate(k);
+        let growth = coll_base(k.len())
+            + vs.iter().map(|v| elem_size(v.len())).sum::<usize>()
+            + inner.insert_growth(lock, k);
         inner.reserve(growth)?;
 
         let now = inner.now();
-        let mut shard = inner.shard(k).write();
-        inner.purge_locked(&mut shard, k, now);
-        let e = inner.entry_or_insert(&mut shard, k, || Value::List(VecDeque::new()));
+        let (idx, lock, h) = inner.locate(k);
+        let mut shard = lock.write();
+        inner.purge_locked(&mut shard, idx, h, k, now);
+        let e = inner.coll_entry(&mut shard, h, k, || Collection::List(VecDeque::new()));
         inner.stamp(e);
-        let Value::List(list) = &mut e.value else {
+        let coll = coll_mut(e)?;
+        let Collection::List(list) = &mut coll.data else {
             return Err(StoreError::WrongType);
         };
         for v in vs {
-            inner.charge(v.len() + ELEM_OVERHEAD);
+            inner.coll_resize(&mut coll.bytes, 0, elem_size(v.len()));
             if front {
                 list.push_front(v);
             } else {
@@ -448,7 +495,7 @@ impl Store {
             }
         }
         let len = list.len();
-        inner.drop_if_empty(&mut shard, k);
+        inner.drop_if_empty(&mut shard, idx, h, k);
         Ok(len)
     }
 
@@ -461,14 +508,17 @@ impl Store {
     }
 
     fn pop(&self, k: &[u8], front: bool) -> Result<Option<Vec<u8>>> {
-        let now = self.inner.now();
-        let mut shard = self.inner.shard(k).write();
-        self.inner.purge_locked(&mut shard, k, now);
-        let Some(e) = shard.get_mut(k) else {
+        let inner = &self.inner;
+        let now = inner.now();
+        let (idx, lock, h) = inner.locate(k);
+        let mut shard = lock.write();
+        inner.purge_locked(&mut shard, idx, h, k, now);
+        let Some(e) = shard.find_mut(h, |e| e.key() == k) else {
             return Ok(None);
         };
-        self.inner.stamp(e);
-        let Value::List(list) = &mut e.value else {
+        inner.stamp(e);
+        let coll = coll_mut(e)?;
+        let Collection::List(list) = &mut coll.data else {
             return Err(StoreError::WrongType);
         };
         let popped = if front {
@@ -477,17 +527,17 @@ impl Store {
             list.pop_back()
         };
         if let Some(v) = &popped {
-            self.inner.refund(v.len() + ELEM_OVERHEAD);
+            inner.coll_resize(&mut coll.bytes, elem_size(v.len()), 0);
         }
-        self.inner.drop_if_empty(&mut shard, k);
+        inner.drop_if_empty(&mut shard, idx, h, k);
         Ok(popped)
     }
 
     /// Inclusive range with Redis semantics: negative indexes count from the tail,
     /// out-of-range bounds are clamped, and an empty result is returned when start > stop.
     pub fn lrange(&self, k: &[u8], start: i64, stop: i64) -> Result<Vec<Vec<u8>>> {
-        self.inner.read_with(k, |v| match v {
-            Value::List(l) => Ok(match list_bounds(l.len(), start, stop) {
+        self.inner.read_with(k, |e| match collection(e)? {
+            Collection::List(l) => Ok(match list_bounds(l.len(), start, stop) {
                 Some((a, b)) => l.range(a..=b).cloned().collect(),
                 None => Vec::new(),
             }),
@@ -496,8 +546,8 @@ impl Store {
     }
 
     pub fn llen(&self, k: &[u8]) -> Result<usize> {
-        self.inner.read_with(k, |v| match v {
-            Value::List(l) => Ok(l.len()),
+        self.inner.read_with(k, |e| match collection(e)? {
+            Collection::List(l) => Ok(l.len()),
             _ => Err(StoreError::WrongType),
         })
     }
@@ -507,69 +557,76 @@ impl Store {
     /// Returns the number of members newly added.
     pub fn sadd(&self, k: &[u8], ms: Vec<Vec<u8>>) -> Result<usize> {
         let inner = &self.inner;
-        let growth =
-            ENTRY_OVERHEAD + k.len() + ms.iter().map(|m| m.len() + ELEM_OVERHEAD).sum::<usize>();
+        let (_, lock, _) = inner.locate(k);
+        let growth = coll_base(k.len())
+            + ms.iter().map(|m| elem_size(m.len())).sum::<usize>()
+            + inner.insert_growth(lock, k);
         inner.reserve(growth)?;
 
         let now = inner.now();
-        let mut shard = inner.shard(k).write();
-        inner.purge_locked(&mut shard, k, now);
-        let e = inner.entry_or_insert(&mut shard, k, || Value::Set(Set::default()));
+        let (idx, lock, h) = inner.locate(k);
+        let mut shard = lock.write();
+        inner.purge_locked(&mut shard, idx, h, k, now);
+        let e = inner.coll_entry(&mut shard, h, k, || Collection::Set(Set::default()));
         inner.stamp(e);
-        let Value::Set(set) = &mut e.value else {
+        let coll = coll_mut(e)?;
+        let Collection::Set(set) = &mut coll.data else {
             return Err(StoreError::WrongType);
         };
         let mut added = 0;
         for m in ms {
-            let size = m.len() + ELEM_OVERHEAD;
+            let size = elem_size(m.len());
             if set.insert(m) {
-                inner.charge(size);
+                inner.coll_resize(&mut coll.bytes, 0, size);
                 added += 1;
             }
         }
-        inner.drop_if_empty(&mut shard, k);
+        inner.drop_if_empty(&mut shard, idx, h, k);
         Ok(added)
     }
 
     pub fn srem(&self, k: &[u8], ms: &[&[u8]]) -> Result<usize> {
-        let now = self.inner.now();
-        let mut shard = self.inner.shard(k).write();
-        self.inner.purge_locked(&mut shard, k, now);
-        let Some(e) = shard.get_mut(k) else {
+        let inner = &self.inner;
+        let now = inner.now();
+        let (idx, lock, h) = inner.locate(k);
+        let mut shard = lock.write();
+        inner.purge_locked(&mut shard, idx, h, k, now);
+        let Some(e) = shard.find_mut(h, |e| e.key() == k) else {
             return Ok(0);
         };
-        self.inner.stamp(e);
-        let Value::Set(set) = &mut e.value else {
+        inner.stamp(e);
+        let coll = coll_mut(e)?;
+        let Collection::Set(set) = &mut coll.data else {
             return Err(StoreError::WrongType);
         };
         let mut removed = 0;
         for m in ms {
             if set.remove(*m) {
-                self.inner.refund(m.len() + ELEM_OVERHEAD);
+                inner.coll_resize(&mut coll.bytes, elem_size(m.len()), 0);
                 removed += 1;
             }
         }
-        self.inner.drop_if_empty(&mut shard, k);
+        inner.drop_if_empty(&mut shard, idx, h, k);
         Ok(removed)
     }
 
     pub fn smembers(&self, k: &[u8]) -> Result<Vec<Vec<u8>>> {
-        self.inner.read_with(k, |v| match v {
-            Value::Set(s) => Ok(s.iter().cloned().collect()),
+        self.inner.read_with(k, |e| match collection(e)? {
+            Collection::Set(s) => Ok(s.iter().cloned().collect()),
             _ => Err(StoreError::WrongType),
         })
     }
 
     pub fn sismember(&self, k: &[u8], m: &[u8]) -> Result<bool> {
-        self.inner.read_with(k, |v| match v {
-            Value::Set(s) => Ok(s.contains(m)),
+        self.inner.read_with(k, |e| match collection(e)? {
+            Collection::Set(s) => Ok(s.contains(m)),
             _ => Err(StoreError::WrongType),
         })
     }
 
     pub fn scard(&self, k: &[u8]) -> Result<usize> {
-        self.inner.read_with(k, |v| match v {
-            Value::Set(s) => Ok(s.len()),
+        self.inner.read_with(k, |e| match collection(e)? {
+            Collection::Set(s) => Ok(s.len()),
             _ => Err(StoreError::WrongType),
         })
     }
@@ -580,9 +637,13 @@ impl Inner {
         (self.clock)()
     }
 
-    pub(crate) fn shard(&self, k: &[u8]) -> &RwLock<ShardMap> {
-        let idx = (self.hasher.hash_one(k) as usize) & self.mask;
-        &self.shards[idx]
+    /// Shard lock and full hash for `k`. The shard index is taken from hash bits 32 and up:
+    /// hashbrown indexes slots with the low bits and tags with the top 7, so sharing those
+    /// bits with the shard choice would leave every shard's table mostly empty.
+    pub(crate) fn locate(&self, k: &[u8]) -> (usize, &RwLock<ShardMap>, u64) {
+        let h = self.hasher.hash_one(k);
+        let idx = ((h >> 32) as usize) & self.mask;
+        (idx, &self.shards[idx], h)
     }
 
     pub(crate) fn charge(&self, n: usize) {
@@ -593,12 +654,19 @@ impl Inner {
         self.used.fetch_sub(n, Relaxed);
     }
 
+    /// Replaces an `old`-byte charge with a `new`-byte one.
     pub(crate) fn resize(&self, old: usize, new: usize) {
         if new > old {
             self.charge(new - old);
         } else {
             self.refund(old - new);
         }
+    }
+
+    /// Like `resize`, also keeping a collection's cached element byte count in step.
+    pub(crate) fn coll_resize(&self, bytes: &mut usize, old: usize, new: usize) {
+        *bytes = (*bytes).saturating_sub(old) + new;
+        self.resize(old, new);
     }
 
     /// Records an access so LRU eviction can order keys. Skipped when no budget is set.
@@ -609,77 +677,142 @@ impl Inner {
         }
     }
 
-    pub(crate) fn new_entry(&self, value: Value, expires_at: Option<u64>) -> Entry {
-        let e = Entry::new(value, expires_at);
+    pub(crate) fn new_entry(&self, k: &[u8], v: &[u8], expires_at: u64) -> Entry {
+        let e = Entry::new_str(k, v, expires_at);
         self.stamp(&e);
         e
     }
 
     /// Size of the live (unexpired) entry for `k`, if any. Takes only a read lock.
     pub(crate) fn live_size(&self, k: &[u8], now: u64) -> Option<usize> {
-        let shard = self.shard(k).read();
+        let (_, lock, h) = self.locate(k);
+        let shard = lock.read();
         shard
-            .get(k)
+            .find(h, |e| e.key() == k)
             .filter(|e| !e.is_expired(now))
-            .map(|e| entry_size(k, e))
+            .map(Entry::heap_size)
     }
 
     /// Removes `k` if it is expired. Caller holds the shard's write lock.
-    pub(crate) fn purge_locked(&self, shard: &mut ShardMap, k: &[u8], now: u64) {
-        if matches!(shard.get(k), Some(e) if e.is_expired(now)) {
-            self.remove_locked(shard, k);
+    pub(crate) fn purge_locked(
+        &self,
+        shard: &mut ShardMap,
+        idx: usize,
+        h: u64,
+        k: &[u8],
+        now: u64,
+    ) {
+        if shard
+            .find(h, |e| e.key() == k)
+            .is_some_and(|e| e.is_expired(now))
+        {
+            self.remove_hashed(shard, idx, h, k);
         }
+    }
+
+    /// Removes `k` (with precomputed hash `h`) and refunds its memory.
+    pub(crate) fn remove_hashed(&self, shard: &mut ShardMap, idx: usize, h: u64, k: &[u8]) -> bool {
+        let removed = match shard.find_entry(h, |e| e.key() == k) {
+            Ok(occupied) => {
+                let (e, _) = occupied.remove();
+                self.refund(e.heap_size());
+                true
+            }
+            Err(_) => false,
+        };
+        if removed {
+            self.maybe_shrink(shard, idx);
+        }
+        removed
     }
 
     /// Removes `k` and refunds its memory. Returns whether it was present.
-    pub(crate) fn remove_locked(&self, shard: &mut ShardMap, k: &[u8]) -> bool {
-        match shard.remove(k) {
-            Some(e) => {
-                self.refund(entry_size(k, &e));
-                true
-            }
-            None => false,
-        }
+    pub(crate) fn remove_locked(&self, shard: &mut ShardMap, idx: usize, k: &[u8]) -> bool {
+        let h = self.hasher.hash_one(k);
+        self.remove_hashed(shard, idx, h, k)
     }
 
     /// Inserts or replaces `k`, keeping the memory counter exact.
-    pub(crate) fn put_locked(&self, shard: &mut ShardMap, k: &[u8], e: Entry) {
-        let size = entry_size(k, &e);
-        if let Some(old) = shard.insert(k.into(), e) {
-            self.refund(entry_size(k, &old));
+    pub(crate) fn put_locked(&self, shard: &mut ShardMap, idx: usize, h: u64, k: &[u8], e: Entry) {
+        let size = e.heap_size();
+        if let Some(old) = shard.find_mut(h, |o| o.key() == k) {
+            let old_size = old.heap_size();
+            *old = e;
+            self.refund(old_size);
+        } else {
+            shard.insert_unique(h, e, |o| self.hasher.hash_one(o.key()));
         }
         self.charge(size);
+        self.settle(idx, shard);
     }
 
     /// Enforces the Redis rule that empty collections do not exist.
-    pub(crate) fn drop_if_empty(&self, shard: &mut ShardMap, k: &[u8]) {
-        let empty = match shard.get(k) {
-            Some(e) => match &e.value {
-                Value::Bytes(_) => false,
-                Value::List(l) => l.is_empty(),
-                Value::Hash(h) => h.is_empty(),
-                Value::Set(s) => s.is_empty(),
-            },
-            None => false,
-        };
+    pub(crate) fn drop_if_empty(&self, shard: &mut ShardMap, idx: usize, h: u64, k: &[u8]) {
+        let empty = shard
+            .find(h, |e| e.key() == k)
+            .and_then(|e| e.coll())
+            .is_some_and(|c| c.data.is_empty());
         if empty {
-            self.remove_locked(shard, k);
+            self.remove_hashed(shard, idx, h, k);
         }
+        self.settle(idx, shard);
     }
 
-    /// Returns the entry for `k`, inserting `make()` first if it is missing.
-    pub(crate) fn entry_or_insert<'a>(
+    /// Returns the entry for `k`, inserting an empty collection first if it is missing.
+    /// The caller must have purged expired keys and must check the entry's type.
+    pub(crate) fn coll_entry<'a>(
         &self,
         shard: &'a mut ShardMap,
+        h: u64,
         k: &[u8],
-        make: impl FnOnce() -> Value,
+        make: impl FnOnce() -> Collection,
     ) -> &'a mut Entry {
-        if !shard.contains_key(k) {
-            let e = self.new_entry(make(), None);
-            self.charge(ENTRY_OVERHEAD + k.len());
-            shard.insert(k.into(), e);
+        let entry = shard
+            .entry(h, |e| e.key() == k, |e| self.hasher.hash_one(e.key()))
+            .or_insert_with(|| {
+                let e = Entry::new_coll(k, make());
+                self.charge(e.heap_size());
+                e
+            });
+        // The caller reports table growth through `settle` once the write is done.
+        entry.into_mut()
+    }
+
+    /// Shrinks a table that has become mostly empty, so its buckets go back to the allocator.
+    pub(crate) fn maybe_shrink(&self, shard: &mut ShardMap, idx: usize) {
+        let cap = shard.capacity();
+        // An empty table gives back its buckets regardless of size; otherwise only large
+        // tables are worth the rehash.
+        let worth = if shard.is_empty() {
+            cap > 0
+        } else {
+            cap >= MIN_SHRINK_CAPACITY && shard.len() * 4 < cap
+        };
+        if worth {
+            shard.shrink_to_fit(|e| self.hasher.hash_one(e.key()));
         }
-        shard.get_mut(k).expect("entry was just inserted")
+        self.settle(idx, shard);
+    }
+
+    /// Extra table bytes that inserting `k` will add to its shard, zero if the table has room.
+    /// Read under a shared lock; another writer may race, so this is an estimate.
+    pub(crate) fn insert_growth(&self, lock: &RwLock<ShardMap>, k: &[u8]) -> usize {
+        let shard = lock.read();
+        if shard
+            .find(self.hasher.hash_one(k), |e| e.key() == k)
+            .is_some()
+        {
+            return 0;
+        }
+        table_growth(shard.len(), shard.capacity())
+    }
+
+    /// Brings shard `idx`'s charged table bytes in line with its real bucket array. Called
+    /// with the shard's write lock held, after every operation that can grow or shrink it.
+    pub(crate) fn settle(&self, idx: usize, shard: &ShardMap) {
+        let now = table_bytes(shard.capacity());
+        let was = self.table_charge[idx].swap(now, Relaxed);
+        self.resize(was, now);
     }
 
     /// Runs `f` on the live entry for `k`. Expired keys are removed on the way.
@@ -689,10 +822,10 @@ impl Inner {
         f: impl FnOnce(&Entry) -> Result<R>,
     ) -> Result<Option<R>> {
         let now = self.now();
-        let lock = self.shard(k);
+        let (idx, lock, h) = self.locate(k);
         {
             let shard = lock.read();
-            match shard.get(k) {
+            match shard.find(h, |e| e.key() == k) {
                 None => return Ok(None),
                 Some(e) if !e.is_expired(now) => {
                     self.stamp(e);
@@ -702,7 +835,7 @@ impl Inner {
             }
         }
         // Expired: retake the lock exclusively and remove it.
-        self.purge_locked(&mut lock.write(), k, now);
+        self.purge_locked(&mut lock.write(), idx, h, k, now);
         Ok(None)
     }
 
@@ -710,9 +843,9 @@ impl Inner {
     pub(crate) fn read_with<R: Default>(
         &self,
         k: &[u8],
-        f: impl FnOnce(&Value) -> Result<R>,
+        f: impl FnOnce(&Entry) -> Result<R>,
     ) -> Result<R> {
-        Ok(self.read_key(k, |e| f(&e.value))?.unwrap_or_default())
+        Ok(self.read_key(k, f)?.unwrap_or_default())
     }
 }
 
@@ -861,6 +994,7 @@ pub(crate) fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::value::{alloc_size, str_entry_size, table_bytes};
     use super::*;
     use std::thread;
 
@@ -1204,15 +1338,104 @@ mod tests {
         assert_eq!(s.used_memory(), 0);
         s.set(b"k", vec![0; 100], None, false, false).unwrap();
         let first = s.used_memory();
-        assert_eq!(first, entry_size_of(b"k", 100));
+        // Entry heap plus the bucket array of the shard it landed in.
+        assert_eq!(first, entry_size_of(b"k", 100) + table_bytes(3));
         s.set(b"k", vec![0; 10], None, false, false).unwrap();
-        assert_eq!(s.used_memory(), entry_size_of(b"k", 10));
+        assert_eq!(s.used_memory(), entry_size_of(b"k", 10) + table_bytes(3));
         s.delete(&[b"k"]);
-        assert_eq!(s.used_memory(), 0);
+        assert_eq!(s.used_memory(), 0, "emptied shard gives its table back");
     }
 
     fn entry_size_of(key: &[u8], value_len: usize) -> usize {
-        ENTRY_OVERHEAD + key.len() + value_len
+        str_entry_size(key.len(), value_len)
+    }
+
+    #[test]
+    fn flush_returns_table_buckets_to_the_allocator() {
+        let s = Store::new(cfg());
+        for i in 0..5_000 {
+            s.set(format!("k{i}").as_bytes(), vec![0; 64], None, false, false)
+                .unwrap();
+        }
+        let filled = s.used_memory();
+        let table_cap: usize = s.inner.shards.iter().map(|l| l.read().capacity()).sum();
+        assert!(table_cap >= 5_000);
+        s.flush();
+        assert_eq!(s.used_memory(), 0);
+        assert!(s.inner.shards.iter().all(|l| l.read().capacity() == 0));
+        assert!(filled > 5_000 * 64);
+    }
+
+    #[test]
+    fn mass_delete_shrinks_shard_tables() {
+        let s = Store::new(cfg());
+        for i in 0..20_000 {
+            s.set(format!("k{i}").as_bytes(), vec![0; 8], None, false, false)
+                .unwrap();
+        }
+        let full = s.used_memory();
+        let keys: Vec<String> = (0..19_000).map(|i| format!("k{i}")).collect();
+        for k in &keys {
+            s.delete(&[k.as_bytes()]);
+        }
+        assert_eq!(s.dbsize(), 1_000);
+        // 1k live keys in 64 shards must not keep the tables sized for 20k.
+        assert!(
+            s.used_memory() * 3 < full,
+            "tables kept: {} of {full}",
+            s.used_memory()
+        );
+        // The charge matches what the tables hold right now.
+        let heap: usize = s
+            .inner
+            .shards
+            .iter()
+            .map(|l| l.read().iter().map(Entry::heap_size).sum::<usize>())
+            .sum();
+        let tables: usize = s
+            .inner
+            .shards
+            .iter()
+            .map(|l| table_bytes(l.read().capacity()))
+            .sum();
+        assert_eq!(s.used_memory(), heap + tables);
+    }
+
+    #[test]
+    fn accounting_is_exact_for_100k_string_keys() {
+        // Deterministic size check: the charge equals the sum of per-entry heap blocks plus
+        // the bucket arrays actually allocated. Every term is integer arithmetic on fixed
+        // sizes, so this cannot flake. The probe in examples/mem_probe.rs checks it against RSS.
+        let s = Store::new(cfg());
+        for i in 0..100_000 {
+            s.set(
+                format!("k{i:07}").as_bytes(),
+                vec![b'x'; 64],
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        }
+        assert_eq!(s.dbsize(), 100_000);
+        let heap: usize = s
+            .inner
+            .shards
+            .iter()
+            .map(|l| l.read().iter().map(Entry::heap_size).sum::<usize>())
+            .sum();
+        let tables: usize = s
+            .inner
+            .shards
+            .iter()
+            .map(|l| table_bytes(l.read().capacity()))
+            .sum();
+        assert_eq!(s.used_memory(), heap + tables);
+        // Per key: a 72 B heap block (key and value, rounded) plus a 41 B bucket, at this
+        // table size about 0.6 of the way between powers of two. Measured at 133 B/key. The
+        // bound catches gross mis-accounting in either direction, not the last byte.
+        let per_key = s.used_memory() / 100_000;
+        assert!((110..=160).contains(&per_key), "per key {per_key}");
     }
 
     // ---- hashes --------------------------------------------------------
@@ -1268,8 +1491,12 @@ mod tests {
         let s = Store::new(cfg());
         s.hset(b"h", b"f", vec![0; 10]).unwrap();
         let with_one = s.used_memory();
+        // 10 and 4 byte values both round up to one 16-byte allocation, so the charge is unchanged.
         s.hset(b"h", b"f", vec![0; 4]).unwrap();
-        assert_eq!(s.used_memory(), with_one - 6);
+        assert_eq!(s.used_memory(), with_one);
+        // Growing past a granule is charged for the larger allocation.
+        s.hset(b"h", b"f", vec![0; 40]).unwrap();
+        assert_eq!(s.used_memory(), with_one + alloc_size(40) - alloc_size(10));
         s.hdel(b"h", &[b"f"]).unwrap();
         assert_eq!(s.used_memory(), 0);
     }
@@ -1516,7 +1743,8 @@ mod tests {
 
     #[test]
     fn noeviction_oom_on_each_write_kind() {
-        let s = budgeted(Policy::NoEviction, 300);
+        // The budget leaves room for the 200-byte value and its shard's first bucket array.
+        let s = budgeted(Policy::NoEviction, 300 + table_bytes(3));
         s.set(b"fill", vec![0; 200], None, false, false).unwrap();
         assert_eq!(s.incr_by(b"n", 1), Err(StoreError::Oom));
         assert_eq!(s.append(b"x", &[0; 500]), Err(StoreError::Oom));
@@ -1614,7 +1842,8 @@ mod tests {
 
     #[test]
     fn volatile_lru_oom_without_volatile_keys() {
-        let s = budgeted(Policy::VolatileLru, 500);
+        // Two 150-byte values (176 B each after rounding) plus their table fit; a third does not.
+        let s = budgeted(Policy::VolatileLru, 704);
         s.set(b"p1", vec![0; 150], None, false, false).unwrap();
         s.set(b"p2", vec![0; 150], None, false, false).unwrap();
         assert_eq!(
@@ -1626,7 +1855,7 @@ mod tests {
 
     #[test]
     fn volatile_lru_reports_oom_when_only_persistent_keys_left() {
-        let s = budgeted(Policy::VolatileLru, 500);
+        let s = budgeted(Policy::VolatileLru, 500 + table_bytes(3));
         s.set(b"p", vec![0; 100], None, false, false).unwrap();
         s.set(b"v", vec![0; 10], Some(60_000), false, false)
             .unwrap();

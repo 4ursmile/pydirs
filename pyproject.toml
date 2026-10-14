@@ -23,6 +23,9 @@ classifiers = [
   "Topic :: Software Development :: Libraries",
 ]
 
+[project.scripts]
+tinycache-server = "tinycache._cli:main"
+
 [project.urls]
 Homepage = "https://github.com/4ursmile/tinycache"
 Repository = "https://github.com/4ursmile/tinycache"
@@ -39,3 +42,6 @@ features = ["python"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
+markers = [
+  "leak: memory and file-descriptor leak checks (python -m pytest -m leak)",
+]

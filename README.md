@@ -277,9 +277,11 @@ shows the cost of the network hop, not a like-for-like engine comparison.
 **Size.** Wheel 333 KB (extension module 646 KB, sdist 77 KB), against a 2.0 MB
 `redis-server` binary.
 
-**Memory, 1M keys x 64 B values.** Redis grew by 128 MB. tinycache grew by
-about 500 MB RSS, although its own `used_memory` estimate says 131 MB, so the
-accounting undercounts and `max_memory` limits are not accurate yet.
+**Memory, 1M keys x 64 B values.** Redis grew by 129 MB, tinycache by 187 MB
+(1.45x Redis; it was 501 MB before the memory rework). `used_memory` reports
+158 MB, within 20% of the real growth, so `max_memory` limits are now close to
+honest. On macOS freed memory is not always returned to the OS, so RSS after
+`flush()` stays high even though the allocator holds nothing live.
 
 ### Pros and cons
 
@@ -291,8 +293,7 @@ pydantic helpers and `memoize` built in; optional RESP2 server for redis clients
 Cons: not a distributed or persistent store (no replication, clustering, disk
 persistence, pub/sub or Lua); the cache is per process, so workers do not share
 it unless you run the server; pipelined SET and INCR over the server are 3 to 4
-times slower than Redis; memory use is about 4x Redis for small keys and the
-accounting is inaccurate; a plain `dict` is about 3 to 5 times faster for a
+times slower than Redis; memory use is about 1.5x Redis for small keys; a plain `dict` is about 3 to 5 times faster for a
 single-process cache with no TTL needs; far less mature and tested than Redis.
 
 ## Supported platforms
@@ -324,6 +325,16 @@ pip install maturin pytest
 maturin develop --release
 pytest
 ```
+
+Memory-leak tests carry the `leak` pytest marker. A plain `pytest` run includes
+them. To run only the leak tests:
+
+```bash
+pytest -m leak
+```
+
+The Rust leak checks run under valgrind on Linux in CI. See
+[docs/architecture.md](docs/architecture.md#testing-for-leaks).
 
 ## License
 

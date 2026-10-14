@@ -7,7 +7,7 @@
 use std::sync::atomic::Ordering::Relaxed;
 
 use super::store::{Inner, Policy, Result, StoreError};
-use super::value::ShardMap;
+use super::value::{Entry, ShardMap};
 
 /// Number of candidate keys considered per eviction.
 const SAMPLE_SIZE: usize = 5;
@@ -43,7 +43,7 @@ impl Inner {
     pub(crate) fn evict_one(&self, volatile_only: bool) -> bool {
         let tick = self.tick.load(Relaxed);
         let start = self.next_rand() as usize;
-        let mut best: Option<(u32, usize, Box<[u8]>)> = None;
+        let mut best: Option<(u32, usize, Vec<u8>)> = None;
         let mut found = 0;
         for i in 0..self.shards.len() {
             let idx = start.wrapping_add(i) & self.mask;
@@ -62,7 +62,7 @@ impl Inner {
             return false;
         };
         let mut shard = self.shards[idx].write();
-        self.remove_locked(&mut shard, &key);
+        self.remove_locked(&mut shard, idx, &key);
         true
     }
 
@@ -85,24 +85,24 @@ fn pick_victim(
     volatile_only: bool,
     tick: u32,
     rnd: u64,
-) -> Option<(u32, Box<[u8]>)> {
+) -> Option<(u32, Vec<u8>)> {
     let len = shard.len();
     if len == 0 {
         return None;
     }
     let offset = (rnd % len as u64) as usize;
-    let mut best: Option<(u32, &Box<[u8]>)> = None;
+    let mut best: Option<(u32, &Entry)> = None;
     let window = shard
         .iter()
         .skip(offset)
         .chain(shard.iter())
-        .filter(|(_, e)| !volatile_only || e.expires_at.is_some())
+        .filter(|e| !volatile_only || e.expires_at != 0)
         .take(SAMPLE_SIZE);
-    for (k, e) in window {
+    for e in window {
         let age = tick.wrapping_sub(e.last_access.load(Relaxed));
         if best.is_none_or(|(a, _)| age > a) {
-            best = Some((age, k));
+            best = Some((age, e));
         }
     }
-    best.map(|(age, k)| (age, k.clone()))
+    best.map(|(age, e)| (age, e.key().to_vec()))
 }

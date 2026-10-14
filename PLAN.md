@@ -143,6 +143,51 @@ s = Server(cache=c, host="127.0.0.1", port=6380); s.start() (background thread);
 - `pyproject.toml`: add `pydantic = ["pydantic>=2.5"]` under optional-dependencies, and add pydantic to `test` extra (CI installs it). Python 3.9–3.14: pydantic >= 2.12 supports 3.14; CI pip resolves a supporting version, no pin.
 - Tests (skip with `pytest.importorskip` where pydantic is required, plus one test file that blocks pydantic import to prove the no-pydantic path works): model round trip, nested model, `list[Model]`, `Optional`, validation error on corrupt/mismatched data, TTL, `mget_model`, hash model fields, memoize with annotation returning model instance (assert `isinstance`), memoize with `model=` override, memoize of `list[Model]`, memoize with a pydantic model argument, async memoize, cached `None`, ImportError hint when pydantic missing.
 
+### 4c. Memory diet (Task D, src/core only, public API unchanged)
+
+Measured problem: 1M keys (~8 B key, 64 B value) take 449 MB RSS in a pure-Rust probe (449 B/key; Redis ~128 B/key) while `used_memory()` says 131 MB. `flush()` also returns little memory. Causes: fat `Entry` (enum with a HashMap variant, `Option<u64>`, atomic, `Box<[u8]>` key) in `std::HashMap` slots that double and run at 44-87% load; key and value in two separate allocations (malloc rounds each to 16 B); accounting ignores all of it.
+Targets (measure with a probe example, `examples/mem_probe.rs`, release, `--no-default-features`):
+- 1M keys x 64 B values: **<= 200 MB RSS growth** (stretch 160 MB), and `used_memory()` within **+-25 %** of measured RSS growth.
+- `flush()` / deleting most keys must actually release table memory (replace or shrink maps).
+- No throughput regression beyond 10 % in `cargo bench`.
+Direction (agent may deviate if measurements say so): `hashbrown::HashTable<Entry>` (add dep `hashbrown = "0.15"`) so the key lives inside the entry; string key+value in ONE `Box<[u8]>` (`key_len` stored in entry); collections behind `Option<Box<Collection>>` so the slot stays <= 40 B; `expires_at: u64` with 0 = none; `last_access: AtomicU32`. Accounting must charge slot size amortised for load factor, 16-byte allocation rounding, and element overheads for collections.
+
+### 4d. Persistence (Task E, src/core/persist/**, hooks in store.rs, server commands)
+
+Opt-in. `Config.persist: Option<PersistConfig>` (Config loses `Copy`, keeps `Clone`; `..Config::default()` usage stays valid).
+```rust
+pub struct PersistConfig { pub dir: PathBuf, pub fsync: FsyncPolicy, pub snapshot_interval_secs: u64 /*0 = only on save()/close()*/ }
+pub enum FsyncPolicy { Always, EverySec, Never }
+Store::open(cfg: Config) -> io::Result<Store>   // loads snapshot, replays WAL; Store::new(cfg) = open without persistence (panics if cfg.persist is Some: use open)
+Store::save(&self) -> io::Result<()>            // synchronous snapshot + WAL rotation
+Store::persist_stats(&self) -> Option<PersistStats>  // { last_save_ms, snapshot_bytes, wal_bytes, loaded_keys, last_error: Option<String> }
+Store::close()  // stops threads, fsyncs WAL, writes a final snapshot when persistence is on
+```
+Design (snapshot + WAL):
+- Files in `dir`: `snapshot.tcs` (+ `snapshot.tmp` during write), `wal-<gen>.log`, a `LOCK` file (advisory, `fs2`-free: create_new + pid; refuse to open if held by a live process, error `io::ErrorKind::WouldBlock`).
+- Snapshot format: magic `TCSNAP01`, version u32, generation u64, then records `[type u8][key len varint][key][expires_at_ms u64][payload]` for Bytes/List/Hash/Set, terminated by an EOF marker and a CRC32 of everything (implement CRC32 locally, ~20 lines, no dep). Written to `snapshot.tmp`, fsynced, atomically renamed, then the directory fsynced. Expired keys are skipped when writing and when loading. TTLs are stored as ABSOLUTE ms since epoch (so downtime counts).
+- WAL: append-only records `[len u32][crc32 u32][payload]` where payload is one logical mutation (Set with exp, Del, Expire/Persist, Incr/Append logged as the RESULTING Set so replay is idempotent, Hash/List/Set ops logged as the op). A torn/corrupt tail record is detected by CRC/length and the file is truncated there on load (log a warning in `last_error`, never crash). Appends happen under the shard write lock so per-key order is preserved; a single `Mutex<BufWriter>` WAL writer is fine. `EverySec` fsyncs from a background thread; `Always` fsyncs per write; `Never` leaves it to the OS.
+- Consistent snapshot: acquire read locks on ALL shards (in index order), rotate the WAL to generation g+1 while still holding them (writers are blocked, so no append can interleave), then stream the snapshot with `generation = g+1`, release locks as soon as serialisation of each shard completes. After the snapshot is renamed, delete `wal-<g>.log` and older. Load = snapshot(gen n) then replay `wal-n.log`. If the process dies between rotation and rename, the old snapshot + old WAL + new WAL are all still present: load must pick the newest valid snapshot, then replay every WAL with generation >= snapshot generation in order... (agent: write this precisely and test crash points with fault injection: kill between each step by calling internal step functions).
+- Background snapshotter thread every `snapshot_interval_secs` (only if dirty since last save). Stops with the store.
+- Memory limits and eviction must not run while replaying (restore fully, then enforce limit lazily on next write).
+- Server (src/server): new commands `SAVE`, `BGSAVE` (runs save on a thread, replies "Background saving started"), `LASTSAVE`, `INFO` (text with `used_memory`, `keys`, `uptime_seconds`, `persistence` lines), `AUTH password` and `ServerOptions { password: Option<String> }` via new `pub fn start_with_options(store, host, port, opts) -> io::Result<ServerHandle>` (keep `start` unchanged); when a password is set every command except AUTH, PING?no: except AUTH and QUIT returns `-NOAUTH Authentication required.`; compare in constant time.
+- Tests: round trip every type + TTL across reopen; expired keys not restored; torn WAL tail; corrupt snapshot CRC falls back (error, empty or previous gen, never panic); crash-point tests; fsync policies; concurrent writers during `save()` then reopen and compare with an in-memory oracle; lock file contention; SIGKILL-style test by dropping without close (use an internal `abandon()` test hook).
+
+### 4e. Shared server and client (Task F, Python layer; F2 wires persistence)
+
+Per-process caches are not shared between workers. Solution: run `tinycache-server` once and let every process use `tinycache.Client`, which has the SAME API as `Cache`.
+- `tinycache.Client(host="127.0.0.1", port=6380, password=None, timeout=5.0, pool_size=8, decode=False, serializer="raw")`: pure-Python, thread-safe (small connection pool), RESP2 over sockets, reconnect once on a broken connection, pipelining via `with client.pipeline() as p:` (optional, nice-to-have). Implements the same methods as Cache (strings, keys, hash, list, set, JSON, pydantic, dict sugar, memoize, context manager). Errors map the same: `-WRONGTYPE` -> TypeError, `-OOM` -> MemoryError, not-an-integer -> ValueError, connection failure -> `ConnectionError`.
+- Refactor so `Cache` and `Client` share one mixin (`_api.py`: decode, serializer, JSON, pydantic, memoize, sugar) over a tiny bytes-level backend interface; do not duplicate those features.
+- CLI `tinycache-server` (also `python -m tinycache`): `--host 127.0.0.1 --port 6380 --max-memory 0 --policy noeviction --shards 64 --dir PATH --fsync everysec|always|never --snapshot-interval 300 --requirepass PASS` (or env `TINYCACHE_PASSWORD`); handles SIGINT/SIGTERM with a clean shutdown that saves; prints a one-line startup banner; refuses to bind a non-loopback host without `--requirepass` unless `--allow-insecure`. `[project.scripts] tinycache-server = "tinycache._cli:main"` (already added to pyproject).
+- F1 (now): Client, mixin refactor, CLI, tests against `Server` + CLI subprocess. F2 (after Task E): `Cache(persist_dir=None, fsync="everysec", snapshot_interval=300)`, `Cache.save()`, `Cache.persist_stats`, `Server(password=)`, lib.rs bindings, .pyi, and CLI `--dir/--fsync/--snapshot-interval/--requirepass` wiring, tests.
+
+### 4f. Memory-leak testing (applies to every task)
+
+A leak test runs a workload many times and asserts memory is flat after warm-up, so growth proportional to iterations fails. Never assert on a single run.
+- **Rust** (`src/core`, `src/server`, tests marked `#[ignore]`-free but fast, < 10 s total): a helper measures live heap with a counting `#[global_allocator]` wrapper (test-only, in a `tests/` integration file so it does not affect the library) and asserts `bytes_in_use` after N cycles <= baseline + tolerance (e.g. 1 MiB). Cycles: set/delete 100k keys x 10 rounds; set with TTL then let the sweeper expire them; flush after fill; collection create/empty/auto-remove; eviction churn under `max_memory`; `Store` create + `close()` + drop x 200 (sweeper thread joined, no thread count growth: check `/proc/self/task` on Linux or skip elsewhere); server start/stop x 50 and 200 connect/disconnect cycles (thread and fd counts return to baseline).
+- **Python** (`tests/python/test_leaks.py`, marker `leak`, uses `resource`/`psutil`-free RSS via `/proc/self/statm` or `ps`): Cache create/close/del x 500; set/get/delete loops; `mget`/`hgetall`/`smembers` returning big results discarded x 1000; exceptions raised in a loop (`WRONGTYPE`, bad types) do not leak; JSON/pydantic round trips; `memoize` with unique args (cache bounded by TTL/flush); Server start/stop x 50 and Client connect/close x 200 (open fd count via `os.listdir('/dev/fd')` back to baseline); GIL-release paths under threads. Assert RSS growth over the last half of the run <= a few MB; use `gc.collect()` and warm-up first.
+- **CI** (Linux only): extra job runs the Rust tests under `valgrind --leak-check=full --error-exitcode=1` on the core and server test binaries, and the Python `-m leak` tests; plus `RUSTFLAGS=-Zsanitizer=leak` is NOT used (needs nightly).
+
 ## 5. Tasks
 
 - **A — Rust core** (`src/core/**`, `benches/**`, Rust unit tests incl. fake-clock TTL tests, eviction tests, glob tests, concurrency test with 8 threads). `cargo test --no-default-features` must pass (see Cargo features: `python` feature gates PyO3).

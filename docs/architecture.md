@@ -135,3 +135,28 @@ CPython stable ABI for Python 3.9 and later.
 - The release profile uses fat LTO, `codegen-units = 1`, and `strip = true` for
   speed and size. `panic` stays `unwind` because PyO3 requires it.
 - CI runs the CPU matrix described in [releasing.md](releasing.md#what-the-workflows-do).
+
+## Testing for leaks
+
+Leak tests run a workload many times and check that memory stays flat after
+warm-up. Growth that scales with the number of iterations is a failure. No test
+asserts on a single run.
+
+- **Rust** (`tests/leaks.rs` and the lib tests): a test-only counting
+  `#[global_allocator]` in an integration test file measures live heap. The
+  test asserts that bytes in use after N cycles stay within a baseline plus a
+  tolerance (about 1 MiB). Cycles cover set/delete, TTL expiry through the
+  sweeper, flush, collection auto-removal, eviction churn, and repeated
+  `Store` create/close/drop.
+- **Python** (`tests/python/test_leaks.py`, marker `leak`): RSS is read from
+  `/proc/self/statm`, after `gc.collect()` and a warm-up. The test fails if RSS
+  grows by more than a few MB over the second half of the run. Open file
+  descriptors are compared by listing `/dev/fd`.
+- **CI** (`leaks` job, Linux only): the Rust test binaries run under
+  `valgrind --leak-check=full --errors-for-leak-kinds=definite --error-exitcode=1`.
+  The binaries come from cargo's JSON build output. `TINYCACHE_VALGRIND=1` is set
+  so the tests can lower their iteration counts. The Python `-m leak` tests run
+  against a release build of the extension.
+
+Sanitizer-based checks (`-Zsanitizer=leak`) are not used, because they need a
+nightly toolchain.

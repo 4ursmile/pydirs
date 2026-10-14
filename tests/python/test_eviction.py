@@ -52,8 +52,9 @@ def test_volatile_lru_only_evicts_keys_with_ttl() -> None:
 
 
 def test_volatile_lru_without_ttl_keys_raises() -> None:
-    # Each 400-byte entry accounts for about 465 bytes; three exceed a 1000-byte budget.
-    with Cache(max_memory=1000, policy="volatile-lru", shards=1) as c:
+    # One shard: first entry costs ~608 bytes (table floor + 416), each further one ~416,
+    # so two fit in 1200 bytes (1024) and a third does not (1440).
+    with Cache(max_memory=1200, policy="volatile-lru", shards=1) as c:
         c.set("a", PAYLOAD)
         c.set("b", PAYLOAD)
         with pytest.raises(MemoryError):

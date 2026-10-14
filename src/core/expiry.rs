@@ -33,7 +33,7 @@ impl Inner {
     /// One sweep pass over every shard. Samples keys and repeats while many are expired.
     pub(crate) fn sweep_once(&self) {
         let now = self.now();
-        for lock in self.shards.iter() {
+        for (idx, lock) in self.shards.iter().enumerate() {
             let mut shard = lock.write();
             for _ in 0..MAX_ROUNDS {
                 if shard.is_empty() {
@@ -41,19 +41,19 @@ impl Inner {
                 }
                 // A window that wraps past the end of the shard, so every key can be sampled.
                 let offset = (self.next_rand() % shard.len() as u64) as usize;
-                let dead: Vec<Box<[u8]>> = shard
+                let dead: Vec<Vec<u8>> = shard
                     .iter()
                     .skip(offset)
                     .chain(shard.iter())
                     .take(SAMPLE_SIZE)
-                    .filter(|(_, e)| e.is_expired(now))
-                    .map(|(k, _)| k.clone())
+                    .filter(|e| e.is_expired(now))
+                    .map(|e| e.key().to_vec())
                     .collect();
                 if dead.is_empty() {
                     break;
                 }
                 for k in &dead {
-                    self.remove_locked(&mut shard, k);
+                    self.remove_locked(&mut shard, idx, k);
                 }
             }
         }

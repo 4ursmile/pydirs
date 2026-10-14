@@ -65,3 +65,70 @@ jobs:
 
       - name: Run Python tests
         run: pytest
+
+  leaks:
+    name: Memory-leak tests (Linux)
+    needs: lint
+    runs-on: ubuntu-latest
+    env:
+      # Leak tests read this to scale iteration counts down under valgrind.
+      TINYCACHE_VALGRIND: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install valgrind and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind jq
+
+      - name: Build Rust test binaries
+        run: |
+          cargo test --no-default-features --no-run --message-format=json > cargo-test-build.json
+          # Lib unit-test binary is always checked. tests/leaks.rs is checked only
+          # if it exists (it is written by a separate task and may be absent).
+          if [ -f tests/leaks.rs ]; then
+            TARGETS='["_tinycache", "leaks"]'
+          else
+            echo "tests/leaks.rs not present; checking only the lib test binary."
+            TARGETS='["_tinycache"]'
+          fi
+          jq -r --argjson targets "$TARGETS" '
+            select(.reason == "compiler-artifact" and .profile.test == true and .executable != null)
+            | select(.target.name as $n | $targets | index($n))
+            | .executable' cargo-test-build.json > test-binaries.txt
+          echo "Test binaries to check:"
+          cat test-binaries.txt
+          if [ ! -s test-binaries.txt ]; then
+            echo "::error::No lib test binary found in cargo JSON output."
+            exit 1
+          fi
+
+      - name: Run Rust tests under valgrind
+        run: |
+          while read -r bin; do
+            echo "::group::valgrind $bin"
+            valgrind --leak-check=full --errors-for-leak-kinds=definite \
+              --error-exitcode=1 "$bin" --test-threads=1
+            echo "::endgroup::"
+          done < test-binaries.txt
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and install extension (release)
+        run: |
+          pip install maturin "pytest>=7" pytest-asyncio pydantic
+          maturin develop --release
+
+      - name: Run Python leak tests
+        run: |
+          if [ ! -f tests/python/test_leaks.py ]; then
+            echo "tests/python/test_leaks.py not present; skipping Python leak tests."
+            exit 0
+          fi
+          pytest -m leak -v

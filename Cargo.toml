@@ -18,6 +18,7 @@ python = ["dep:pyo3"]
 [dependencies]
 ahash = "0.8"
 parking_lot = "0.12"
+hashbrown = "0.15"
 pyo3 = { version = "0.23", features = ["abi3-py39", "extension-module"], optional = true }
 
 [dev-dependencies]
